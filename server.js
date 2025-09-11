@@ -11,11 +11,6 @@ import pg from "pg";
 const { Pool } = pg;
 
 
-const express = require('express');
-const axios = require('axios');
-const crypto = require('crypto');
-const { Pool } = require('pg');
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
