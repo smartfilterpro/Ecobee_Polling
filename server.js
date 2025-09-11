@@ -2,6 +2,15 @@
 // SmartFilterPro — Ecobee poller/bridge for Railway with runtime tracking
 // Node 18+, Express, pg, axios
 
+// server.js (ESM)
+
+import express from "express";
+import axios from "axios";
+import crypto from "crypto";
+import pg from "pg";
+const { Pool } = pg;
+
+
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
