@@ -1,4 +1,4 @@
-// server.js — Ecobee summary poller (ESM) with runtime tracking and optional detail enrichment
+// server.js — Ecobee summary poller (ESM) with runtime tracking + detailed logging
 // Node 18+, "type": "module" in package.json
 
 import express from "express";
@@ -12,23 +12,19 @@ const { Pool } = pg;
    ────────────────────────────────────────────────────────────────────────── */
 const PORT = process.env.PORT || 3000;
 
-// Bubble webhook to receive updates (backend workflow URL)
 const BUBBLE_THERMOSTAT_UPDATES_URL =
   (process.env.BUBBLE_THERMOSTAT_UPDATES_URL || "").trim();
 
-// Ecobee OAuth app
 const ECOBEE_CLIENT_ID = (process.env.ECOBEE_CLIENT_ID || "").trim();
 const ECOBEE_TOKEN_URL = "https://api.ecobee.com/token";
 
-// Polling/behavior
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000); // 1 min
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000);
 const ERROR_BACKOFF_MS = Number(process.env.ERROR_BACKOFF_MS || 120_000);
 const MAX_ACCUMULATE_SECONDS = Number(process.env.MAX_ACCUMULATE_SECONDS || 600);
 
-// Optional: enrich posts (on state change or session end) with temps via /thermostat
+// Enrich state-change / session-end posts with temps via /thermostat
 const ENRICH_WITH_DETAILS = process.env.ENRICH_WITH_DETAILS === "1";
 
-// Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : undefined,
@@ -63,6 +59,11 @@ function isExpiringSoon(expiresAtISO, thresholdSec = 120) {
   return new Date(expiresAtISO).getTime() - Date.now() <= thresholdSec * 1000;
 }
 
+// Pretty logger for small JSON payloads
+function j(obj) {
+  try { return JSON.stringify(obj); } catch { return String(obj); }
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    DB schema + helpers
    ────────────────────────────────────────────────────────────────────────── */
@@ -73,10 +74,10 @@ async function ensureSchema() {
     CREATE TABLE IF NOT EXISTS ecobee_tokens (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id TEXT NOT NULL,
-      hvac_id TEXT NOT NULL,           -- Ecobee thermostat identifier string
+      hvac_id TEXT NOT NULL,
       access_token TEXT NOT NULL,
       refresh_token TEXT NOT NULL,
-      expires_at TIMESTAMPTZ NOT NULL, -- absolute expiry for access token
+      expires_at TIMESTAMPTZ NOT NULL,
       scope TEXT,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -207,10 +208,9 @@ async function refreshEcobeeTokens(refresh_token) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     timeout: 20_000,
   });
-  return res.data; // { access_token, token_type, refresh_token, expires_in, scope? }
+  return res.data;
 }
 
-// Lightweight summary (all registered thermostats on this account)
 async function fetchThermostatSummary(access_token) {
   const sel = {
     selection: {
@@ -233,7 +233,6 @@ async function fetchThermostatSummary(access_token) {
   return res.data;
 }
 
-// Optional: enrich with temps/setpoints for a specific thermostat
 async function fetchThermostatDetails(access_token, hvac_id) {
   const q = {
     selection: {
@@ -261,10 +260,6 @@ async function fetchThermostatDetails(access_token, hvac_id) {
 /* ──────────────────────────────────────────────────────────────────────────
    Summary parsing + normalization
    ────────────────────────────────────────────────────────────────────────── */
-/**
- * Build a map { thermostatId -> equipmentStatus } from thermostatSummary
- * - statusList looks like ["123456789:cooling,fan", "987654321:"]
- */
 function mapStatusFromSummary(summary) {
   const statusList = Array.isArray(summary?.statusList) ? summary.statusList : [];
   const map = new Map();
@@ -282,7 +277,6 @@ function mapStatusFromSummary(summary) {
 function normalizeFromSummary({ user_id, hvac_id }, equipStatus, details) {
   const parsed = parseEquipStatus(equipStatus);
 
-  // optional temps from details
   let actualTemperatureF = null;
   let desiredHeatF = null;
   let desiredCoolF = null;
@@ -303,9 +297,9 @@ function normalizeFromSummary({ user_id, hvac_id }, equipStatus, details) {
   return {
     userId: user_id,
     hvacId: hvac_id,
-    thermostatName,           // may be null if not enriched
-    hvacMode,                 // may be null if not enriched
-    equipmentStatus: parsed.raw, // e.g., "cooling,fan" or ""
+    thermostatName,
+    hvacMode,
+    equipmentStatus: parsed.raw,
     isCooling: parsed.isCooling,
     isHeating: parsed.isHeating,
     isFanOnly: parsed.isFanOnly,
@@ -319,22 +313,18 @@ function normalizeFromSummary({ user_id, hvac_id }, equipStatus, details) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
-   Posting to Bubble
+   Posting to Bubble (with logging)
    ────────────────────────────────────────────────────────────────────────── */
-async function postToBubble(payload) {
+async function postToBubble(payload, label = "state") {
   if (!BUBBLE_THERMOSTAT_UPDATES_URL) {
     throw new Error("BUBBLE_THERMOSTAT_UPDATES_URL not set");
   }
   await axios.post(BUBBLE_THERMOSTAT_UPDATES_URL, payload, { timeout: 20_000 });
+  console.log(`[${payload.hvacId}] → POSTED to Bubble (${label}) ${nowUtc()} :: ${j(payload)}`);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
-   Runtime policy:
-   - running := cooling || heating || fan-only
-   - start (false->true): set started_at/last_tick_at; no post
-   - tick (true->true): accumulate seconds (capped by MAX_ACCUMULATE_SECONDS)
-   - stop (true->false): finalize, POST runtimeSeconds with stopped payload; reset session
-   - state-change posts de-dup w/o runtimeSeconds; session-end always posts with runtimeSeconds
+   Runtime policy (with logging)
    ────────────────────────────────────────────────────────────────────────── */
 async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
   const rt = await getRuntime(hvac_id);
@@ -350,7 +340,6 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
     );
   }
 
-  // Load again (cheap)
   const current = (await getRuntime(hvac_id)) || {
     is_running: false,
     current_session_seconds: 0,
@@ -358,7 +347,7 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
   };
 
   if (!current.is_running && isRunning) {
-    // start
+    console.log(`[${hvac_id}] ▶️ session START at ${nowIso}`);
     await setRuntime(hvac_id, {
       is_running: true,
       current_session_started_at: nowIso,
@@ -368,21 +357,21 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
   }
 
   if (current.is_running && isRunning) {
-    // accumulate
     const lastTick = current.last_tick_at ? toMillis(current.last_tick_at) : Date.now();
     const deltaSec = Math.min(
       Math.max(0, Math.round((Date.now() - lastTick) / 1000)),
       MAX_ACCUMULATE_SECONDS
     );
+    const newTotal = (current.current_session_seconds || 0) + deltaSec;
     await setRuntime(hvac_id, {
-      current_session_seconds: (current.current_session_seconds || 0) + deltaSec,
+      current_session_seconds: newTotal,
       last_tick_at: nowIso,
     });
+    console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s)`);
     return { postedSessionEnd: false };
   }
 
   if (current.is_running && !isRunning) {
-    // finalize and post runtime
     const lastTick = current.last_tick_at ? toMillis(current.last_tick_at) : Date.now();
     const deltaSec = Math.min(
       Math.max(0, Math.round((Date.now() - lastTick) / 1000)),
@@ -390,12 +379,9 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
     );
     const finalTotal = (current.current_session_seconds || 0) + deltaSec;
 
+    console.log(`[${hvac_id}] ⏹️ session END (runtimeSeconds=${finalTotal}) at ${nowIso}`);
     const payload = { ...normalized, isRunning: false, runtimeSeconds: finalTotal };
-    await postToBubble(payload);
-
-   await postToBubble(payload);
-   console.log(`[${hvac_id}] → posted update to Bubble at ${nowUtc()}`);
-
+    await postToBubble(payload, "session-end");
 
     await resetRuntime(hvac_id);
     return { postedSessionEnd: true };
@@ -406,12 +392,13 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
-   Poller (summary-first)
+   Poller (summary-first) with logging
    ────────────────────────────────────────────────────────────────────────── */
 async function pollOnce() {
   const tokens = await loadAllTokens();
   if (!tokens.length) return;
 
+  console.log(`\n🕒 poll tick @ ${nowUtc()} — ${tokens.length} thermostat(s)`);
   for (const row of tokens) {
     const { user_id, hvac_id } = row;
     let { access_token, refresh_token, expires_at } = row;
@@ -430,18 +417,18 @@ async function pollOnce() {
             refresh_token,
             expires_in: refreshed.expires_in,
           });
+          console.log(`[${hvac_id}] 🔁 token refreshed`);
         } catch (e) {
-          console.warn(`[${hvac_id}] refresh (pre-summary) failed`, e?.response?.data || e.message);
+          console.warn(`[${hvac_id}] ⚠️ refresh (pre-summary) failed`, e?.response?.data || e.message);
         }
       }
 
-      // summary poll (single call returns all ids on the account)
+      // summary poll
       let summary;
       try {
         summary = await fetchThermostatSummary(access_token);
       } catch (e) {
         if (e?.response?.status === 401) {
-          // forced refresh
           const refreshed = await refreshEcobeeTokens(refresh_token);
           access_token = refreshed.access_token;
           refresh_token = refreshed.refresh_token;
@@ -452,68 +439,70 @@ async function pollOnce() {
             refresh_token,
             expires_in: refreshed.expires_in,
           });
+          console.log(`[${hvac_id}] 🔁 token refreshed after 401`);
           summary = await fetchThermostatSummary(access_token);
         } else {
           throw e;
         }
       }
 
-      // pull equipmentStatus for THIS hvac_id
+      // Extract my hvac status
       const statusMap = mapStatusFromSummary(summary);
       const equipStatus = statusMap.get(hvac_id) ?? "";
+      const parsed = parseEquipStatus(equipStatus);
+      console.log(
+        `[${hvac_id}] 📥 summary equipmentStatus="${equipStatus}" ` +
+        `(cooling=${parsed.isCooling}, heating=${parsed.isHeating}, fanOnly=${parsed.isFanOnly}, running=${parsed.isRunning})`
+      );
 
-      // optionally fetch details only when we need them
-      let details = null;
+      // Optionally enrich details (only when posting later; we fetch lazily below)
 
-      // Minimal normalized payload (may be enriched below)
+      // Build normalized (no details yet)
       let normalized = normalizeFromSummary({ user_id, hvac_id }, equipStatus, null);
 
       // runtime/session handling (may post immediately on session end)
       const result = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
 
-      // For de-dup hash, we ignore runtimeSeconds
+      // De-dup hash (ignore runtimeSeconds)
       let payloadForHash = { ...normalized, runtimeSeconds: null };
-
-      // If we’re enriching, and either state changed or session ended, fetch details now
-      let shouldPostStateChange = false;
-
-      // compute hash vs last
       const newHash = sha(payloadForHash);
       const lastHash = await getLastHash(hvac_id);
+      let shouldPostStateChange = !result.postedSessionEnd && newHash !== lastHash;
 
-      if (!result.postedSessionEnd && newHash !== lastHash) {
-        shouldPostStateChange = true;
-      }
-
+      // If we plan to post, optionally enrich with temps/name/mode
       if ((ENRICH_WITH_DETAILS && (shouldPostStateChange || result.postedSessionEnd))) {
         try {
-          details = await fetchThermostatDetails(access_token, hvac_id);
+          const details = await fetchThermostatDetails(access_token, hvac_id);
+          normalized = normalizeFromSummary({ user_id, hvac_id }, equipStatus, details);
+          payloadForHash = { ...normalized, runtimeSeconds: null };
+
+          // Log what we pulled from /thermostat (only the fields we care about)
+          console.log(
+            `[${hvac_id}] 📥 details name="${normalized.thermostatName}" mode=${normalized.hvacMode || "n/a"} ` +
+            `T=${normalized.actualTemperatureF ?? "n/a"}F setHeat=${normalized.desiredHeatF ?? "n/a"}F setCool=${normalized.desiredCoolF ?? "n/a"}F`
+          );
         } catch (e) {
-          // non-fatal; we'll post without temps
-          console.warn(`[${hvac_id}] enrich fetch failed`, e?.response?.data || e.message);
+          console.warn(`[${hvac_id}] ⚠️ enrich fetch failed`, e?.response?.data || e.message);
         }
-        // rebuild normalized with details
-        normalized = normalizeFromSummary({ user_id, hvac_id }, equipStatus, details);
-        payloadForHash = { ...normalized, runtimeSeconds: null };
       }
 
       // Post state-change (not session end path)
-      if (!result.postedSessionEnd && shouldPostStateChange) {
-        await postToBubble({ ...normalized, runtimeSeconds: null });
-        await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
+      if (shouldPostStateChange) {
+        const outgoing = { ...normalized, runtimeSeconds: null };
+        await postToBubble(outgoing, "state-change");
+        await setLastState(hvac_id, outgoing);
       } else if (result.postedSessionEnd) {
-        // after session end we still update last state hash with runtimeSeconds null
+        // After a session-end post, still update last-state hash with runtimeSeconds null
         await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
       }
     } catch (err) {
-      console.error(`[${row.hvac_id}] poll error:`, err?.response?.data || err.message || String(err));
+      console.error(`[${row.hvac_id}] ❌ poll error:`, err?.response?.data || err.message || String(err));
       await new Promise((r) => setTimeout(r, ERROR_BACKOFF_MS));
     }
   }
 }
 
 function startPoller() {
-  // kick off quickly, then interval
   pollOnce().catch(() => {});
   setInterval(() => pollOnce().catch(() => {}), POLL_INTERVAL_MS);
 }
@@ -548,6 +537,7 @@ app.post("/ecobee/link", async (req, res) => {
   try {
     const { user_id, hvac_id, access_token, refresh_token, expires_in, scope } = req.body || {};
     await upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope });
+    console.log(`[${hvac_id}] 🔗 link/upsert from Bubble @ ${nowUtc()}`);
     res.json({ ok: true, saved: true });
   } catch (e) {
     console.error("link error:", e);
@@ -561,11 +551,15 @@ app.post("/ecobee/unlink", async (req, res) => {
   await pool.query(`DELETE FROM ecobee_tokens WHERE user_id = $1 AND hvac_id = $2`, [user_id, hvac_id]);
   await pool.query(`DELETE FROM ecobee_last_state WHERE hvac_id = $1`, [hvac_id]);
   await pool.query(`DELETE FROM ecobee_runtime WHERE hvac_id = $1`, [hvac_id]);
+  console.log(`[${hvac_id}] 🗑️ unlink cleanup complete @ ${nowUtc()}`);
   res.json({ ok: true, removed: true });
 });
 
 // boot
 (async () => {
+  if (!BUBBLE_THERMOSTAT_UPDATES_URL || /your-bubble-app\.com/.test(BUBBLE_THERMOSTAT_UPDATES_URL)) {
+    console.error("❌ BUBBLE_THERMOSTAT_UPDATES_URL is not set to a real Bubble URL.");
+  }
   await ensureSchema();
   app.listen(PORT, () => console.log(`✅ Ecobee summary poller listening on :${PORT}`));
   startPoller();
