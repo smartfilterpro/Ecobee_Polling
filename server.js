@@ -393,6 +393,10 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
     const payload = { ...normalized, isRunning: false, runtimeSeconds: finalTotal };
     await postToBubble(payload);
 
+   await postToBubble(payload);
+   console.log(`[${hvac_id}] → posted update to Bubble at ${nowUtc()}`);
+
+
     await resetRuntime(hvac_id);
     return { postedSessionEnd: true };
   }
