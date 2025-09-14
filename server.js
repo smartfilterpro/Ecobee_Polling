@@ -32,7 +32,7 @@ function tenthsFToF(x) {
   return Number((x / 10).toFixed(1));
 }
 
-// ✅ Updated parser
+// ✅ Updated parser to handle compCool/compHeat/auxHeat/etc.
 function parseEquipStatus(equipmentStatus) {
   const raw = (equipmentStatus || "").toLowerCase();
   const tokens = raw.split(",").map(s => s.trim()).filter(Boolean);
@@ -100,6 +100,7 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    -- Track last seen revision (from /thermostatSummary revisionList)
     CREATE TABLE IF NOT EXISTS ecobee_revisions (
       hvac_id TEXT PRIMARY KEY,
       last_revision TEXT NOT NULL,
@@ -124,6 +125,7 @@ async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, exp
        updated_at=NOW()`,
     [user_id, hvac_id, access_token, refresh_token, expiresAt, scope || null]
   );
+  // ensure runtime & revision rows
   await pool.query(
     `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,updated_at)
      VALUES ($1,FALSE,NULL,NULL,0,NOW())
@@ -232,11 +234,12 @@ function mapStatusFromSummary(summary) {
   return map;
 }
 function mapRevisionFromSummary(summary) {
+  // Each entry "id:...:runtimeRev:...:xxxx" — store the full string for simplicity
   const list = Array.isArray(summary?.revisionList) ? summary.revisionList : [];
   const map = new Map();
   for (const item of list) {
     const idx = item.indexOf(":");
-    if (idx > 0) map.set(item.slice(0, idx), item);
+    if (idx > 0) map.set(item.slice(0, idx), item); // store whole revision line
   }
   return map;
 }
@@ -367,9 +370,10 @@ async function pollOnce() {
       const parsed = parseEquipStatus(equipStatus);
       console.log(`[${hvac_id}] 📥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning}`);
 
-      const revisionChanged = currentRev && currentRev !== prevRev;
+      const revisionChanged = !!currentRev && currentRev !== prevRev;
 
       if (revisionChanged) {
+        // Fetch details for enrichment
         let details = null;
         try {
           details = await fetchThermostatDetails(access_token, hvac_id);
@@ -378,9 +382,97 @@ async function pollOnce() {
         }
 
         let normalized = normalizeFromDetails({ user_id, hvac_id }, equipStatus, details);
+
+        // Runtime/session handling (may post immediately on session end)
         const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
 
+        // De-dup state-change (ignore runtimeSeconds in hash)
         const payloadForHash = { ...normalized, runtimeSeconds: null };
         const newHash = sha(payloadForHash);
         const lastHash = await getLastHash(hvac_id);
-        const shouldPostStateChange = !runtimeResult.postedSessionEnd && newHash !==
+        const shouldPostStateChange = !runtimeResult.postedSessionEnd && newHash !== lastHash;
+
+        if (shouldPostStateChange) {
+          await postToBubble({ ...normalized, runtimeSeconds: null }, "state-change");
+          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
+        } else if (runtimeResult.postedSessionEnd) {
+          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
+        }
+
+        // Persist new revision after handling
+        await setLastRevision(hvac_id, currentRev);
+      } else {
+        // No revision change → tick runtime accurately using equipmentStatus only
+        const normalized = {
+          userId: user_id,
+          hvacId: hvac_id,
+          thermostatName: null,
+          hvacMode: null,
+          equipmentStatus: equipStatus,
+          ...parseEquipStatus(equipStatus),
+          actualTemperatureF: null,
+          desiredHeatF: null,
+          desiredCoolF: null,
+          ok: true,
+          ts: nowUtc(),
+        };
+        const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
+        if (runtimeResult.postedSessionEnd) {
+          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
+        }
+        // (no revision update)
+      }
+    } catch (err) {
+      console.error(`[${row.hvac_id}] ❌ poll error:`, err?.response?.data || err.message || String(err));
+      await new Promise((r) => setTimeout(r, ERROR_BACKOFF_MS));
+    }
+  }
+}
+function startPoller() {
+  pollOnce().catch(() => {});
+  setInterval(() => pollOnce().catch(() => {}), POLL_INTERVAL_MS);
+}
+
+/* ───────────── HTTP ───────────── */
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+app.get("/health", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true, time: nowUtc() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+app.post("/ecobee/link", async (req, res) => {
+  try {
+    const { user_id, hvac_id, access_token, refresh_token, expires_in, scope } = req.body || {};
+    await upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope });
+    console.log(`[${hvac_id}] 🔗 link/upsert from Bubble @ ${nowUtc()}`);
+    res.json({ ok: true, saved: true });
+  } catch (e) {
+    console.error("link error:", e);
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+app.post("/ecobee/unlink", async (req, res) => {
+  const { user_id, hvac_id } = req.body || {};
+  if (!user_id || !hvac_id) return res.status(400).json({ ok: false, error: "user_id and hvac_id required" });
+  await pool.query(`DELETE FROM ecobee_tokens WHERE user_id=$1 AND hvac_id=$2`, [user_id, hvac_id]);
+  await pool.query(`DELETE FROM ecobee_last_state WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM ecobee_runtime WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM ecobee_revisions WHERE hvac_id=$1`, [hvac_id]);
+  console.log(`[${hvac_id}] 🗑️ unlink cleanup @ ${nowUtc()}`);
+  res.json({ ok: true, removed: true });
+});
+
+/* ───────────── Boot ───────────── */
+(async () => {
+  if (!BUBBLE_THERMOSTAT_UPDATES_URL || /your-bubble-app\.com/.test(BUBBLE_THERMOSTAT_UPDATES_URL)) {
+    console.error("❌ BUBBLE_THERMOSTAT_UPDATES_URL is not set to a real Bubble URL.");
+  }
+  await ensureSchema();
+  app.listen(PORT, () => console.log(`✅ Ecobee summary-driven poller on :${PORT}`));
+  startPoller();
+})();
