@@ -1,5 +1,6 @@
 // server.js — Summary-driven detail fetch (ESM)
 // Polls /thermostatSummary; on change → fetches /thermostat to enrich + post
+
 import express from "express";
 import axios from "axios";
 import crypto from "crypto";
@@ -30,14 +31,36 @@ function tenthsFToF(x) {
   if (x === undefined || x === null) return null;
   return Number((x / 10).toFixed(1));
 }
+
+// ✅ Updated parser
 function parseEquipStatus(equipmentStatus) {
-  const s = (equipmentStatus || "").toLowerCase();
-  const isCooling = s.includes("cooling");
-  const isHeating = s.includes("heating");
-  const isFanOnly = !isCooling && !isHeating && s.includes("fan");
+  const raw = (equipmentStatus || "").toLowerCase();
+  const tokens = raw.split(",").map(s => s.trim()).filter(Boolean);
+  const has = (t) => tokens.includes(t);
+
+  const isCooling =
+    has("cooling") ||
+    has("compcool1") ||
+    has("compcool2");
+
+  const isHeating =
+    has("heating") ||
+    has("compheat1") ||
+    has("compheat2") ||
+    has("auxheat1") ||
+    has("auxheat2") ||
+    has("auxheat3") ||
+    has("heatpump");
+
+  const fanRunning =
+    has("fan") || has("fanonly") || has("fanonly1");
+
+  const isFanOnly = fanRunning && !isCooling && !isHeating;
   const isRunning = isCooling || isHeating || isFanOnly;
+
   return { isCooling, isHeating, isFanOnly, isRunning, raw: equipmentStatus || "" };
 }
+
 function isExpiringSoon(expiresAtISO, thresholdSec = 120) {
   if (!expiresAtISO) return true;
   return new Date(expiresAtISO).getTime() - Date.now() <= thresholdSec * 1000;
@@ -77,7 +100,6 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    -- NEW: Track last seen revision (from /thermostatSummary revisionList)
     CREATE TABLE IF NOT EXISTS ecobee_revisions (
       hvac_id TEXT PRIMARY KEY,
       last_revision TEXT NOT NULL,
@@ -102,7 +124,6 @@ async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, exp
        updated_at=NOW()`,
     [user_id, hvac_id, access_token, refresh_token, expiresAt, scope || null]
   );
-  // ensure runtime & revision rows
   await pool.query(
     `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,updated_at)
      VALUES ($1,FALSE,NULL,NULL,0,NOW())
@@ -211,12 +232,11 @@ function mapStatusFromSummary(summary) {
   return map;
 }
 function mapRevisionFromSummary(summary) {
-  // Each entry "id:...:runtimeRev:...:xxxx" — we store the full string for simplicity
   const list = Array.isArray(summary?.revisionList) ? summary.revisionList : [];
   const map = new Map();
   for (const item of list) {
     const idx = item.indexOf(":");
-    if (idx > 0) map.set(item.slice(0, idx), item); // store whole revision line
+    if (idx > 0) map.set(item.slice(0, idx), item);
   }
   return map;
 }
@@ -347,13 +367,9 @@ async function pollOnce() {
       const parsed = parseEquipStatus(equipStatus);
       console.log(`[${hvac_id}] 📥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning}`);
 
-      // Decide if "changed": revision changed OR equipmentStatus changed
-      const equipChanged = (await getLastHash(hvac_id)) === null ? true : null; // first run will still rely on rev
       const revisionChanged = currentRev && currentRev !== prevRev;
 
-      // Always fetch details when revision changed (your request)
       if (revisionChanged) {
-        // fetch details now
         let details = null;
         try {
           details = await fetchThermostatDetails(access_token, hvac_id);
@@ -361,96 +377,10 @@ async function pollOnce() {
           console.warn(`[${hvac_id}] ⚠️ details fetch failed`, e?.response?.data || e.message);
         }
 
-        // Build normalized w/ details
         let normalized = normalizeFromDetails({ user_id, hvac_id }, equipStatus, details);
-
-        // Handle runtime (may post session end)
         const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
 
-        // For state-change posts, de-dup by hash (ignore runtimeSeconds)
         const payloadForHash = { ...normalized, runtimeSeconds: null };
         const newHash = sha(payloadForHash);
         const lastHash = await getLastHash(hvac_id);
-        const shouldPostStateChange = !runtimeResult.postedSessionEnd && newHash !== lastHash;
-
-        if (shouldPostStateChange) {
-          await postToBubble({ ...normalized, runtimeSeconds: null }, "state-change");
-          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
-        } else if (runtimeResult.postedSessionEnd) {
-          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
-        }
-
-        // Persist new revision last
-        await setLastRevision(hvac_id, currentRev);
-      } else {
-        // No revision change. Still update runtime ticks using equipStatus only.
-        // Build minimal normalized (no temps) to tick runtime accurately.
-        const normalized = {
-          userId: user_id, hvacId: hvac_id,
-          thermostatName: null, hvacMode: null,
-          equipmentStatus: equipStatus,
-          ...parseEquipStatus(equipStatus),
-          actualTemperatureF: null, desiredHeatF: null, desiredCoolF: null,
-          ok: true, ts: nowUtc(),
-        };
-        const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
-        if (runtimeResult.postedSessionEnd) {
-          // Keep last_state consistent even if no revision change triggered a state post
-          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
-        }
-        // no lastRevision update since it didn’t change
-      }
-    } catch (err) {
-      console.error(`[${row.hvac_id}] ❌ poll error:`, err?.response?.data || err.message || String(err));
-      await new Promise((r) => setTimeout(r, ERROR_BACKOFF_MS));
-    }
-  }
-}
-function startPoller() {
-  pollOnce().catch(() => {});
-  setInterval(() => pollOnce().catch(() => {}), POLL_INTERVAL_MS);
-}
-
-/* ───────────── HTTP ───────────── */
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-
-app.get("/health", async (_req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true, time: nowUtc() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-app.post("/ecobee/link", async (req, res) => {
-  try {
-    const { user_id, hvac_id, access_token, refresh_token, expires_in, scope } = req.body || {};
-    await upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope });
-    console.log(`[${hvac_id}] 🔗 link/upsert from Bubble @ ${nowUtc()}`);
-    res.json({ ok: true, saved: true });
-  } catch (e) {
-    console.error("link error:", e);
-    res.status(400).json({ ok: false, error: e.message });
-  }
-});
-app.post("/ecobee/unlink", async (req, res) => {
-  const { user_id, hvac_id } = req.body || {};
-  if (!user_id || !hvac_id) return res.status(400).json({ ok: false, error: "user_id and hvac_id required" });
-  await pool.query(`DELETE FROM ecobee_tokens WHERE user_id=$1 AND hvac_id=$2`, [user_id, hvac_id]);
-  await pool.query(`DELETE FROM ecobee_last_state WHERE hvac_id=$1`, [hvac_id]);
-  await pool.query(`DELETE FROM ecobee_runtime WHERE hvac_id=$1`, [hvac_id]);
-  await pool.query(`DELETE FROM ecobee_revisions WHERE hvac_id=$1`, [hvac_id]);
-  console.log(`[${hvac_id}] 🗑️ unlink cleanup @ ${nowUtc()}`);
-  res.json({ ok: true, removed: true });
-});
-
-/* ───────────── Boot ───────────── */
-(async () => {
-  if (!BUBBLE_THERMOSTAT_UPDATES_URL || /your-bubble-app\.com/.test(BUBBLE_THERMOSTAT_UPDATES_URL)) {
-    console.error("❌ BUBBLE_THERMOSTAT_UPDATES_URL is not set to a real Bubble URL.");
-  }
-  await ensureSchema();
-  app.listen(PORT, () => console.log(`✅ Ecobee summary-driven poller on :${PORT}`));
-  startPoller();
-})();
+        const shouldPostStateChange = !runtimeResult.postedSessionEnd && newHash !==
