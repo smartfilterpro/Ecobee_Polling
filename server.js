@@ -1,6 +1,7 @@
 // server.js — Summary-driven detail fetch (ESM)
 // Polls /thermostatSummary; on change → fetches /thermostat to enrich + post
 // Adds last-run-state (mode + equipmentStatus) to session-end posts
+// [CONNECTIVITY] Adds isReachable on every post + ConnectivityStatusChanged events
 
 import express from "express";
 import axios from "axios";
@@ -16,6 +17,11 @@ const ECOBEE_TOKEN_URL = "https://api.ecobee.com/token";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000);
 const ERROR_BACKOFF_MS = Number(process.env.ERROR_BACKOFF_MS || 120_000);
 const MAX_ACCUMULATE_SECONDS = Number(process.env.MAX_ACCUMULATE_SECONDS || 600);
+
+// [CONNECTIVITY] knobs
+const REACHABILITY_STALE_MS = Math.max(60_000, Number(process.env.REACHABILITY_STALE_MS || 900_000)); // ≥1 min
+const CONNECTIVITY_CHECK_EVERY_MS = Math.max(15_000, Number(process.env.CONNECTIVITY_CHECK_EVERY_MS || 60_000));
+const PUBLISH_CONNECTIVITY = process.env.PUBLISH_CONNECTIVITY === "0" ? false : true;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -95,9 +101,12 @@ async function ensureSchema() {
       current_session_started_at TIMESTAMPTZ,
       last_tick_at TIMESTAMPTZ,
       current_session_seconds INTEGER NOT NULL DEFAULT 0,
-      -- NEW: track last running state while session is active
+      -- track last running state while session is active
       last_running_mode TEXT,                -- 'cooling' | 'heating' | 'fanonly' | null
       last_equipment_status TEXT,            -- raw equipmentStatus
+      -- [CONNECTIVITY]
+      is_reachable BOOLEAN NOT NULL DEFAULT TRUE,
+      last_seen_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
@@ -105,6 +114,8 @@ async function ensureSchema() {
   // Backfill columns for older deployments (no-op if already exist)
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_running_mode TEXT;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_equipment_status TEXT;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS is_reachable BOOLEAN NOT NULL DEFAULT TRUE;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;`);
 }
 
 async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope }) {
@@ -125,8 +136,8 @@ async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, exp
   );
 
   await pool.query(
-    `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,last_running_mode,last_equipment_status,updated_at)
-     VALUES ($1,FALSE,NULL,NULL,0,NULL,NULL,NOW())
+    `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,last_running_mode,last_equipment_status,is_reachable,last_seen_at,updated_at)
+     VALUES ($1,FALSE,NULL,NULL,0,NULL,NULL,TRUE,NOW(),NOW())
      ON CONFLICT (hvac_id) DO NOTHING`,
     [hvac_id]
   );
@@ -214,6 +225,34 @@ async function setLastRevision(hvac_id, rev) {
   );
 }
 
+// [CONNECTIVITY] helpers
+async function getUserIdForHvac(hvac_id) {
+  const { rows } = await pool.query(`SELECT user_id FROM ecobee_tokens WHERE hvac_id=$1 LIMIT 1`, [hvac_id]);
+  return rows[0]?.user_id || null;
+}
+async function markSeen(hvac_id) {
+  const rt = await getRuntime(hvac_id);
+  const wasReachable = rt?.is_reachable !== false; // default true if null
+  await setRuntime(hvac_id, { is_reachable: true, last_seen_at: nowUtc() });
+  if (PUBLISH_CONNECTIVITY && rt && rt.is_reachable === false) {
+    // flipped false -> true
+    const userId = await getUserIdForHvac(hvac_id);
+    await postConnectivityChange({ userId, hvac_id, isReachable: true, reason: "api_seen" });
+  }
+}
+async function markUnreachableIfStale(hvac_id, last_seen_at) {
+  const last = last_seen_at ? toMillis(last_seen_at) : 0;
+  if (Date.now() - last <= REACHABILITY_STALE_MS) return false;
+  const rt = await getRuntime(hvac_id);
+  if (rt?.is_reachable === false) return false; // already false
+  await setRuntime(hvac_id, { is_reachable: false });
+  if (PUBLISH_CONNECTIVITY) {
+    const userId = await getUserIdForHvac(hvac_id);
+    await postConnectivityChange({ userId, hvac_id, isReachable: false, reason: "stale_timeout" });
+  }
+  return true;
+}
+
 /* ───────────── Ecobee API ───────────── */
 async function refreshEcobeeTokens(refresh_token) {
   const params = new URLSearchParams();
@@ -268,7 +307,7 @@ function mapRevisionFromSummary(summary) {
   return map;
 }
 
-function normalizeFromDetails({ user_id, hvac_id }, equipStatus, details) {
+function normalizeFromDetails({ user_id, hvac_id, isReachable = true }, equipStatus, details) {
   const parsed = parseEquipStatus(equipStatus);
   let actualTemperatureF = null, desiredHeatF = null, desiredCoolF = null, thermostatName = null, hvacMode = null;
   if (details?.thermostatList?.[0]) {
@@ -296,6 +335,8 @@ function normalizeFromDetails({ user_id, hvac_id }, equipStatus, details) {
     desiredCoolF,
     ok: true,
     ts: nowUtc(),
+    // [CONNECTIVITY]
+    isReachable
   };
 }
 
@@ -304,6 +345,31 @@ async function postToBubble(payload, label = "state-change") {
   if (!BUBBLE_THERMOSTAT_UPDATES_URL) throw new Error("BUBBLE_THERMOSTAT_UPDATES_URL not set");
   await axios.post(BUBBLE_THERMOSTAT_UPDATES_URL, payload, { timeout: 20_000 });
   console.log(`[${payload.hvacId}] → POSTED to Bubble (${label}) ${nowUtc()} :: ${j(payload)}`);
+}
+
+// [CONNECTIVITY] lightweight event
+async function postConnectivityChange({ userId, hvac_id, isReachable, reason }) {
+  if (!PUBLISH_CONNECTIVITY) return;
+  const payload = {
+    userId,
+    hvacId: hvac_id,
+    thermostatName: null,
+    hvacMode: null,
+    equipmentStatus: "",
+    isCooling: false,
+    isHeating: false,
+    isFanOnly: false,
+    isRunning: false,
+    actualTemperatureF: null,
+    desiredHeatF: null,
+    desiredCoolF: null,
+    ok: true,
+    ts: nowUtc(),
+    isReachable,
+    eventType: "ConnectivityStatusChanged",
+    reason
+  };
+  await postToBubble(payload, "connectivity");
 }
 
 /* ───────────── Runtime/session ───────────── */
@@ -322,8 +388,8 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
   let rt = await getRuntime(hvac_id);
   if (!rt) {
     await pool.query(
-      `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,last_running_mode,last_equipment_status,updated_at)
-       VALUES ($1,FALSE,NULL,NULL,0,NULL,NULL,NOW())
+      `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,last_running_mode,last_equipment_status,is_reachable,last_seen_at,updated_at)
+       VALUES ($1,FALSE,NULL,NULL,0,NULL,NULL,TRUE,NOW(),NOW())
        ON CONFLICT (hvac_id) DO NOTHING`,
       [hvac_id]
     );
@@ -375,7 +441,7 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
 
     const payload = {
       ...normalized,
-      // normalized here reflects current (stopped) state; include last-run snapshot too:
+      // normalized reflects current (stopped) state; include last-run snapshot too:
       isRunning: false,
       runtimeSeconds: finalTotal,
       lastMode,
@@ -383,6 +449,8 @@ async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
       lastIsHeating,
       lastIsFanOnly,
       lastEquipmentStatus,
+      // [CONNECTIVITY] ensure we carry the DB flag if present
+      isReachable: (rt?.is_reachable !== undefined ? rt.is_reachable : normalized.isReachable)
     };
 
     console.log(`[${hvac_id}] ⏹️ session END ${finalTotal}s; lastMode=${lastMode || "n/a"} lastStatus="${lastEquipmentStatus}"`);
@@ -422,6 +490,8 @@ async function pollOnce() {
       let summary;
       try {
         summary = await fetchThermostatSummary(access_token);
+        // [CONNECTIVITY] success → mark seen (reachable)
+        await markSeen(hvac_id);
       } catch (e) {
         if (e?.response?.status === 401) {
           const refreshed = await refreshEcobeeTokens(refresh_token);
@@ -430,6 +500,7 @@ async function pollOnce() {
           await updateTokensAfterRefresh({ user_id, hvac_id, access_token, refresh_token, expires_in: refreshed.expires_in });
           console.log(`[${hvac_id}] 🔁 token refreshed after 401`);
           summary = await fetchThermostatSummary(access_token);
+          await markSeen(hvac_id);
         } else {
           throw e;
         }
@@ -440,9 +511,11 @@ async function pollOnce() {
       const equipStatus = statusMap.get(hvac_id) ?? "";
       const currentRev = revMap.get(hvac_id) ?? "";
       const prevRev = await getLastRevision(hvac_id);
+      const rt = await getRuntime(hvac_id);
+      const isReachable = rt?.is_reachable !== false; // default true
 
       const parsed = parseEquipStatus(equipStatus);
-      console.log(`[${hvac_id}] 📥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning}`);
+      console.log(`[${hvac_id}] 📥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning} reachable=${isReachable}`);
 
       const revisionChanged = !!currentRev && currentRev !== prevRev;
 
@@ -451,11 +524,13 @@ async function pollOnce() {
         let details = null;
         try {
           details = await fetchThermostatDetails(access_token, hvac_id);
+          // successful details → refresh last_seen_at as well
+          await markSeen(hvac_id);
         } catch (e) {
           console.warn(`[${hvac_id}] ⚠️ details fetch failed`, e?.response?.data || e.message);
         }
 
-        let normalized = normalizeFromDetails({ user_id, hvac_id }, equipStatus, details);
+        let normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details);
 
         // Runtime/session handling (may post immediately on session end)
         const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
@@ -489,6 +564,8 @@ async function pollOnce() {
           desiredCoolF: null,
           ok: true,
           ts: nowUtc(),
+          // [CONNECTIVITY]
+          isReachable
         };
         const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
         if (runtimeResult.postedSessionEnd) {
@@ -497,6 +574,7 @@ async function pollOnce() {
       }
     } catch (err) {
       console.error(`[${row.hvac_id}] ❌ poll error:`, err?.response?.data || err.message || String(err));
+      // Note: we don't mark unreachable on transient errors; staleness scanner handles it.
       await new Promise((r) => setTimeout(r, ERROR_BACKOFF_MS));
     }
   }
@@ -548,6 +626,29 @@ app.post("/ecobee/unlink", async (req, res) => {
     console.error("❌ BUBBLE_THERMOSTAT_UPDATES_URL is not set to a real Bubble URL.");
   }
   await ensureSchema();
-  app.listen(PORT, () => console.log(`✅ Ecobee summary-driven poller on :${PORT}`));
+  const srv = app.listen(PORT, () => console.log(`✅ Ecobee summary-driven poller on :${PORT}`));
   startPoller();
+
+  // [CONNECTIVITY] staleness scanner
+  setInterval(async () => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT hvac_id, last_seen_at, is_reachable
+           FROM ecobee_runtime`
+      );
+      for (const r of rows) {
+        await markUnreachableIfStale(r.hvac_id, r.last_seen_at);
+      }
+    } catch (e) {
+      console.warn("connectivity scan error:", e.message);
+    }
+  }, CONNECTIVITY_CHECK_EVERY_MS).unref();
+
+  // graceful-ish shutdown
+  const shutdown = (sig) => async () => {
+    console.log(`${sig} received, closing…`);
+    try { srv.close(() => process.exit(0)); } catch { process.exit(1); }
+  };
+  process.on("SIGINT", shutdown("SIGINT"));
+  process.on("SIGTERM", shutdown("SIGTERM"));
 })();
