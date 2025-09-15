@@ -1,5 +1,6 @@
 // server.js — Summary-driven detail fetch (ESM)
 // Polls /thermostatSummary; on change → fetches /thermostat to enrich + post
+// Adds last-run-state (mode + equipmentStatus) to session-end posts
 
 import express from "express";
 import axios from "axios";
@@ -32,33 +33,30 @@ function tenthsFToF(x) {
   return Number((x / 10).toFixed(1));
 }
 
-// ✅ Updated parser to handle compCool/compHeat/auxHeat/etc.
+// Updated parser: handles compCool/compHeat/auxHeat/heatPump
 function parseEquipStatus(equipmentStatus) {
   const raw = (equipmentStatus || "").toLowerCase();
   const tokens = raw.split(",").map(s => s.trim()).filter(Boolean);
   const has = (t) => tokens.includes(t);
 
   const isCooling =
-    has("cooling") ||
-    has("compcool1") ||
-    has("compcool2");
+    has("cooling") || has("compcool1") || has("compcool2");
 
   const isHeating =
-    has("heating") ||
-    has("compheat1") ||
-    has("compheat2") ||
-    has("auxheat1") ||
-    has("auxheat2") ||
-    has("auxheat3") ||
+    has("heating") || has("compheat1") || has("compheat2") ||
+    has("auxheat1") || has("auxheat2") || has("auxheat3") ||
     has("heatpump");
 
-  const fanRunning =
-    has("fan") || has("fanonly") || has("fanonly1");
-
+  const fanRunning = has("fan") || has("fanonly") || has("fanonly1");
   const isFanOnly = fanRunning && !isCooling && !isHeating;
   const isRunning = isCooling || isHeating || isFanOnly;
 
-  return { isCooling, isHeating, isFanOnly, isRunning, raw: equipmentStatus || "" };
+  let lastMode = null;
+  if (isCooling) lastMode = "cooling";
+  else if (isHeating) lastMode = "heating";
+  else if (isFanOnly) lastMode = "fanonly";
+
+  return { isCooling, isHeating, isFanOnly, isRunning, lastMode, raw: equipmentStatus || "" };
 }
 
 function isExpiringSoon(expiresAtISO, thresholdSec = 120) {
@@ -97,16 +95,16 @@ async function ensureSchema() {
       current_session_started_at TIMESTAMPTZ,
       last_tick_at TIMESTAMPTZ,
       current_session_seconds INTEGER NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    -- Track last seen revision (from /thermostatSummary revisionList)
-    CREATE TABLE IF NOT EXISTS ecobee_revisions (
-      hvac_id TEXT PRIMARY KEY,
-      last_revision TEXT NOT NULL,
+      -- NEW: track last running state while session is active
+      last_running_mode TEXT,                -- 'cooling' | 'heating' | 'fanonly' | null
+      last_equipment_status TEXT,            -- raw equipmentStatus
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  // Backfill columns for older deployments (no-op if already exist)
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_running_mode TEXT;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_equipment_status TEXT;`);
 }
 
 async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope }) {
@@ -125,12 +123,20 @@ async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, exp
        updated_at=NOW()`,
     [user_id, hvac_id, access_token, refresh_token, expiresAt, scope || null]
   );
-  // ensure runtime & revision rows
+
   await pool.query(
-    `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,updated_at)
-     VALUES ($1,FALSE,NULL,NULL,0,NOW())
+    `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,last_running_mode,last_equipment_status,updated_at)
+     VALUES ($1,FALSE,NULL,NULL,0,NULL,NULL,NOW())
      ON CONFLICT (hvac_id) DO NOTHING`,
     [hvac_id]
+  );
+
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS ecobee_revisions (
+       hvac_id TEXT PRIMARY KEY,
+       last_revision TEXT NOT NULL,
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     );`
   );
   await pool.query(
     `INSERT INTO ecobee_revisions (hvac_id,last_revision,updated_at)
@@ -139,10 +145,12 @@ async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, exp
     [hvac_id]
   );
 }
+
 async function loadAllTokens() {
   const { rows } = await pool.query(`SELECT * FROM ecobee_tokens ORDER BY updated_at DESC`);
   return rows;
 }
+
 async function updateTokensAfterRefresh({ user_id, hvac_id, access_token, refresh_token, expires_in }) {
   const expiresAt = new Date(Date.now() + Number(expires_in) * 1000).toISOString();
   await pool.query(
@@ -152,10 +160,12 @@ async function updateTokensAfterRefresh({ user_id, hvac_id, access_token, refres
     [user_id, hvac_id, access_token, refresh_token, expiresAt]
   );
 }
+
 async function getLastHash(hvac_id) {
   const { rows } = await pool.query(`SELECT last_hash FROM ecobee_last_state WHERE hvac_id=$1`, [hvac_id]);
   return rows[0]?.last_hash || null;
 }
+
 async function setLastState(hvac_id, payload) {
   const h = sha(payload);
   await pool.query(
@@ -166,23 +176,35 @@ async function setLastState(hvac_id, payload) {
   );
   return h;
 }
+
 async function getRuntime(hvac_id) {
   const { rows } = await pool.query(`SELECT * FROM ecobee_runtime WHERE hvac_id=$1`, [hvac_id]);
   return rows[0] || null;
 }
+
 async function setRuntime(hvac_id, fields) {
   const keys = Object.keys(fields);
   const vals = Object.values(fields);
   const sets = keys.map((k, i) => `${k}=$${i + 2}`).join(", ");
   await pool.query(`UPDATE ecobee_runtime SET ${sets}, updated_at=NOW() WHERE hvac_id=$1`, [hvac_id, ...vals]);
 }
+
 async function resetRuntime(hvac_id) {
-  await setRuntime(hvac_id, { is_running: false, current_session_started_at: null, last_tick_at: null, current_session_seconds: 0 });
+  await setRuntime(hvac_id, {
+    is_running: false,
+    current_session_started_at: null,
+    last_tick_at: null,
+    current_session_seconds: 0,
+    last_running_mode: null,
+    last_equipment_status: null,
+  });
 }
+
 async function getLastRevision(hvac_id) {
   const { rows } = await pool.query(`SELECT last_revision FROM ecobee_revisions WHERE hvac_id=$1`, [hvac_id]);
   return rows[0]?.last_revision || "";
 }
+
 async function setLastRevision(hvac_id, rev) {
   await pool.query(
     `INSERT INTO ecobee_revisions (hvac_id,last_revision,updated_at)
@@ -204,6 +226,7 @@ async function refreshEcobeeTokens(refresh_token) {
   });
   return res.data;
 }
+
 async function fetchThermostatSummary(access_token) {
   const sel = { selection: { selectionType: "registered", selectionMatch: "", includeEquipmentStatus: true } };
   const url = "https://api.ecobee.com/1/thermostatSummary?json=" + encodeURIComponent(JSON.stringify(sel));
@@ -213,6 +236,7 @@ async function fetchThermostatSummary(access_token) {
   });
   return res.data;
 }
+
 async function fetchThermostatDetails(access_token, hvac_id) {
   const q = { selection: { selectionType: "thermostats", selectionMatch: hvac_id || "", includeRuntime: true, includeSettings: true, includeEvents: false } };
   const url = "https://api.ecobee.com/1/thermostat?json=" + encodeURIComponent(JSON.stringify(q));
@@ -233,16 +257,17 @@ function mapStatusFromSummary(summary) {
   }
   return map;
 }
+
 function mapRevisionFromSummary(summary) {
-  // Each entry "id:...:runtimeRev:...:xxxx" — store the full string for simplicity
   const list = Array.isArray(summary?.revisionList) ? summary.revisionList : [];
   const map = new Map();
   for (const item of list) {
     const idx = item.indexOf(":");
-    if (idx > 0) map.set(item.slice(0, idx), item); // store whole revision line
+    if (idx > 0) map.set(item.slice(0, idx), item);
   }
   return map;
 }
+
 function normalizeFromDetails({ user_id, hvac_id }, equipStatus, details) {
   const parsed = parseEquipStatus(equipStatus);
   let actualTemperatureF = null, desiredHeatF = null, desiredCoolF = null, thermostatName = null, hvacMode = null;
@@ -282,43 +307,92 @@ async function postToBubble(payload, label = "state-change") {
 }
 
 /* ───────────── Runtime/session ───────────── */
-async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
-  const rt = await getRuntime(hvac_id);
-  const nowIso = nowUtc();
-  const isRunning = !!normalized.isRunning;
+function modeFromParsed(parsed) {
+  if (parsed.isCooling) return "cooling";
+  if (parsed.isHeating) return "heating";
+  if (parsed.isFanOnly) return "fanonly";
+  return null;
+}
 
+async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
+  const nowIso = nowUtc();
+  const parsed = parseEquipStatus(normalized.equipmentStatus);
+  const currentMode = modeFromParsed(parsed);
+
+  let rt = await getRuntime(hvac_id);
   if (!rt) {
     await pool.query(
-      `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,updated_at)
-       VALUES ($1,FALSE,NULL,NULL,0,NOW())
+      `INSERT INTO ecobee_runtime (hvac_id,is_running,current_session_started_at,last_tick_at,current_session_seconds,last_running_mode,last_equipment_status,updated_at)
+       VALUES ($1,FALSE,NULL,NULL,0,NULL,NULL,NOW())
        ON CONFLICT (hvac_id) DO NOTHING`,
       [hvac_id]
     );
+    rt = await getRuntime(hvac_id);
   }
-  const current = (await getRuntime(hvac_id)) || { is_running: false, current_session_seconds: 0, last_tick_at: null };
 
-  if (!current.is_running && isRunning) {
-    console.log(`[${hvac_id}] ▶️ session START @ ${nowIso}`);
-    await setRuntime(hvac_id, { is_running: true, current_session_started_at: nowIso, last_tick_at: nowIso });
+  const isRunning = !!parsed.isRunning;
+
+  // Transition: idle -> running
+  if (!rt.is_running && isRunning) {
+    await setRuntime(hvac_id, {
+      is_running: true,
+      current_session_started_at: nowIso,
+      last_tick_at: nowIso,
+      last_running_mode: currentMode,                 // start tracking last state
+      last_equipment_status: parsed.raw,
+    });
+    console.log(`[${hvac_id}] ▶️ session START @ ${nowIso} (mode=${currentMode || "n/a"}, status="${parsed.raw}")`);
     return { postedSessionEnd: false };
   }
-  if (current.is_running && isRunning) {
-    const lastTick = current.last_tick_at ? toMillis(current.last_tick_at) : Date.now();
+
+  // Running -> running (tick & update last state while active)
+  if (rt.is_running && isRunning) {
+    const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
     const deltaSec = Math.min(Math.max(0, Math.round((Date.now() - lastTick) / 1000)), MAX_ACCUMULATE_SECONDS);
-    const newTotal = (current.current_session_seconds || 0) + deltaSec;
-    await setRuntime(hvac_id, { current_session_seconds: newTotal, last_tick_at: nowIso });
-    console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s)`);
+    const newTotal = (rt.current_session_seconds || 0) + deltaSec;
+    await setRuntime(hvac_id, {
+      current_session_seconds: newTotal,
+      last_tick_at: nowIso,
+      last_running_mode: currentMode || rt.last_running_mode,
+      last_equipment_status: parsed.raw || rt.last_equipment_status,
+    });
+    console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s) mode=${currentMode || rt.last_running_mode || "n/a"} status="${parsed.raw}"`);
     return { postedSessionEnd: false };
   }
-  if (current.is_running && !isRunning) {
-    const lastTick = current.last_tick_at ? toMillis(current.last_tick_at) : Date.now();
+
+  // Running -> idle (stop & POST runtime with last-state)
+  if (rt.is_running && !isRunning) {
+    const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
     const deltaSec = Math.min(Math.max(0, Math.round((Date.now() - lastTick) / 1000)), MAX_ACCUMULATE_SECONDS);
-    const finalTotal = (current.current_session_seconds || 0) + deltaSec;
-    console.log(`[${hvac_id}] ⏹️ session END runtimeSeconds=${finalTotal} @ ${nowIso}`);
-    await postToBubble({ ...normalized, isRunning: false, runtimeSeconds: finalTotal }, "session-end");
+    const finalTotal = (rt.current_session_seconds || 0) + deltaSec;
+
+    // Determine last-state booleans from stored last_running_mode
+    const lastMode = rt.last_running_mode || currentMode || null;
+    const lastIsCooling = lastMode === "cooling";
+    const lastIsHeating = lastMode === "heating";
+    const lastIsFanOnly = lastMode === "fanonly";
+    const lastEquipmentStatus = rt.last_equipment_status || parsed.raw || "";
+
+    const payload = {
+      ...normalized,
+      // normalized here reflects current (stopped) state; include last-run snapshot too:
+      isRunning: false,
+      runtimeSeconds: finalTotal,
+      lastMode,
+      lastIsCooling,
+      lastIsHeating,
+      lastIsFanOnly,
+      lastEquipmentStatus,
+    };
+
+    console.log(`[${hvac_id}] ⏹️ session END ${finalTotal}s; lastMode=${lastMode || "n/a"} lastStatus="${lastEquipmentStatus}"`);
+    await postToBubble(payload, "session-end");
+
     await resetRuntime(hvac_id);
     return { postedSessionEnd: true };
   }
+
+  // Idle -> idle
   return { postedSessionEnd: false };
 }
 
@@ -420,7 +494,6 @@ async function pollOnce() {
         if (runtimeResult.postedSessionEnd) {
           await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
         }
-        // (no revision update)
       }
     } catch (err) {
       console.error(`[${row.hvac_id}] ❌ poll error:`, err?.response?.data || err.message || String(err));
@@ -445,6 +518,7 @@ app.get("/health", async (_req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 app.post("/ecobee/link", async (req, res) => {
   try {
     const { user_id, hvac_id, access_token, refresh_token, expires_in, scope } = req.body || {};
@@ -456,6 +530,7 @@ app.post("/ecobee/link", async (req, res) => {
     res.status(400).json({ ok: false, error: e.message });
   }
 });
+
 app.post("/ecobee/unlink", async (req, res) => {
   const { user_id, hvac_id } = req.body || {};
   if (!user_id || !hvac_id) return res.status(400).json({ ok: false, error: "user_id and hvac_id required" });
