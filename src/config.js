@@ -1,0 +1,18 @@
+export const PORT = Number(process.env.PORT || 3000);
+
+export const BUBBLE_THERMOSTAT_UPDATES_URL = (process.env.BUBBLE_THERMOSTAT_UPDATES_URL || "").trim();
+
+export const ECOBEE_CLIENT_ID = (process.env.ECOBEE_CLIENT_ID || "").trim();
+export const ECOBEE_TOKEN_URL = "https://api.ecobee.com/token";
+
+export const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000);
+export const ERROR_BACKOFF_MS = Number(process.env.ERROR_BACKOFF_MS || 120_000);
+export const MAX_ACCUMULATE_SECONDS = Number(process.env.MAX_ACCUMULATE_SECONDS || 600);
+
+// Connectivity knobs
+export const REACHABILITY_STALE_MS = Math.max(60_000, Number(process.env.REACHABILITY_STALE_MS || 900_000));
+export const CONNECTIVITY_CHECK_EVERY_MS = Math.max(15_000, Number(process.env.CONNECTIVITY_CHECK_EVERY_MS || 60_000));
+export const PUBLISH_CONNECTIVITY = process.env.PUBLISH_CONNECTIVITY === "0" ? false : true;
+
+export const DATABASE_URL = process.env.DATABASE_URL;
+export const PGSSLMODE = process.env.PGSSLMODE;
