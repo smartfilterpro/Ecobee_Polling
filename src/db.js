@@ -1,5 +1,5 @@
 import pg from "pg";
-import { DATABASE_URL, PGSSLMODE, MAX_ACCUMULATE_SECONDS } from "./config.js";
+import { DATABASE_URL, PGSSLMODE } from "./config.js";
 import { nowUtc, sha, toMillis } from "./util.js";
 
 const { Pool } = pg;
@@ -162,13 +162,24 @@ export async function setLastRevision(hvac_id, rev) {
 }
 
 // connectivity helpers
+
 export async function getUserIdForHvac(hvac_id) {
   const { rows } = await pool.query(`SELECT user_id FROM ecobee_tokens WHERE hvac_id=$1 LIMIT 1`, [hvac_id]);
   return rows[0]?.user_id || null;
 }
 
+/**
+ * Mark device as seen (reachable now).
+ * @returns {boolean} true if this call flipped the flag from false -> true
+ */
 export async function markSeen(hvac_id) {
+  const { rows } = await pool.query(
+    `SELECT is_reachable FROM ecobee_runtime WHERE hvac_id=$1`,
+    [hvac_id]
+  );
+  const was = rows[0]?.is_reachable;
   await setRuntime(hvac_id, { is_reachable: true, last_seen_at: nowUtc() });
+  return was === false; // flipped from false -> true
 }
 
 export async function markUnreachableIfStale(hvac_id, last_seen_at, staleMs) {
