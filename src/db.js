@@ -6,6 +6,9 @@ const { Pool } = pg;
 export const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: PGSSLMODE === "require" ? { rejectUnauthorized: false } : undefined,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
 export async function ensureSchema() {
@@ -57,6 +60,12 @@ export async function ensureSchema() {
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_equipment_status TEXT;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS is_reachable BOOLEAN NOT NULL DEFAULT TRUE;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;`);
+
+  // Add indices for performance
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_tokens_hvac_id ON ecobee_tokens(hvac_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_tokens_user_id ON ecobee_tokens(user_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_is_reachable ON ecobee_runtime(is_reachable);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_last_seen ON ecobee_runtime(last_seen_at);`);
 }
 
 export async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope }) {
@@ -170,23 +179,85 @@ export async function getUserIdForHvac(hvac_id) {
 
 /**
  * Mark device as seen (reachable now).
- * @returns {boolean} true if this call flipped the flag from false -> true
+ * Returns connectivity transition info to prevent race conditions.
+ * @returns {object} { wasUnreachable: boolean, userId: string|null }
  */
-export async function markSeen(hvac_id) {
-  const { rows } = await pool.query(
-    `SELECT is_reachable FROM ecobee_runtime WHERE hvac_id=$1`,
-    [hvac_id]
-  );
-  const was = rows[0]?.is_reachable;
-  await setRuntime(hvac_id, { is_reachable: true, last_seen_at: nowUtc() });
-  return was === false; // flipped from false -> true
+export async function markSeenAndGetTransition(hvac_id) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const { rows } = await client.query(
+      `SELECT is_reachable FROM ecobee_runtime WHERE hvac_id=$1 FOR UPDATE`,
+      [hvac_id]
+    );
+    const wasUnreachable = rows[0]?.is_reachable === false;
+    
+    await client.query(
+      `UPDATE ecobee_runtime 
+       SET is_reachable=TRUE, last_seen_at=$2, updated_at=NOW() 
+       WHERE hvac_id=$1`,
+      [hvac_id, nowUtc()]
+    );
+    
+    let userId = null;
+    if (wasUnreachable) {
+      const userResult = await client.query(
+        `SELECT user_id FROM ecobee_tokens WHERE hvac_id=$1 LIMIT 1`,
+        [hvac_id]
+      );
+      userId = userResult.rows[0]?.user_id || null;
+    }
+    
+    await client.query('COMMIT');
+    return { wasUnreachable, userId };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 export async function markUnreachableIfStale(hvac_id, last_seen_at, staleMs) {
   const last = last_seen_at ? toMillis(last_seen_at) : 0;
-  if (Date.now() - last <= staleMs) return false;
-  const { rows } = await pool.query(`SELECT is_reachable FROM ecobee_runtime WHERE hvac_id=$1`, [hvac_id]);
-  if (rows[0]?.is_reachable === false) return false;
-  await setRuntime(hvac_id, { is_reachable: false });
-  return true;
+  if (Date.now() - last <= staleMs) return { flipped: false, userId: null };
+  
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const { rows } = await client.query(
+      `SELECT is_reachable FROM ecobee_runtime WHERE hvac_id=$1 FOR UPDATE`,
+      [hvac_id]
+    );
+    
+    if (rows[0]?.is_reachable === false) {
+      await client.query('COMMIT');
+      return { flipped: false, userId: null };
+    }
+    
+    await client.query(
+      `UPDATE ecobee_runtime SET is_reachable=FALSE, updated_at=NOW() WHERE hvac_id=$1`,
+      [hvac_id]
+    );
+    
+    const userResult = await client.query(
+      `SELECT user_id FROM ecobee_tokens WHERE hvac_id=$1 LIMIT 1`,
+      [hvac_id]
+    );
+    const userId = userResult.rows[0]?.user_id || null;
+    
+    await client.query('COMMIT');
+    return { flipped: true, userId };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function closePool() {
+  await pool.end();
 }
