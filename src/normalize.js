@@ -20,6 +20,23 @@ export function mapRevisionFromSummary(summary) {
   return map;
 }
 
+/**
+ * Parse the connected status from revision string
+ * Format: "identifier:name:connected:thermostatRev:alertsRev:runtimeRev:intervalRev"
+ * @param {string} revisionString 
+ * @returns {boolean} true if connected, false otherwise
+ */
+export function parseConnectedFromRevision(revisionString) {
+  if (!revisionString) return false;
+  const parts = revisionString.split(":");
+  // Third field (index 2) is the connected status
+  if (parts.length >= 3) {
+    const connectedStr = parts[2].toLowerCase();
+    return connectedStr === "true";
+  }
+  return false;
+}
+
 export function normalizeFromDetails({ user_id, hvac_id, isReachable = true }, equipStatus, details) {
   const parsed = parseEquipStatus(equipStatus);
   let actualTemperatureF = null, desiredHeatF = null, desiredCoolF = null, thermostatName = null, hvacMode = null;
