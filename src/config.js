@@ -14,5 +14,12 @@ export const REACHABILITY_STALE_MS = Math.max(60_000, Number(process.env.REACHAB
 export const CONNECTIVITY_CHECK_EVERY_MS = Math.max(15_000, Number(process.env.CONNECTIVITY_CHECK_EVERY_MS || 60_000));
 export const PUBLISH_CONNECTIVITY = process.env.PUBLISH_CONNECTIVITY === "0" ? false : true;
 
+// Parallel processing
+export const POLL_CONCURRENCY = Math.max(1, Number(process.env.POLL_CONCURRENCY || 5));
+
+// Retry configuration
+export const BUBBLE_POST_RETRIES = Number(process.env.BUBBLE_POST_RETRIES || 3);
+export const BUBBLE_POST_RETRY_DELAY_MS = Number(process.env.BUBBLE_POST_RETRY_DELAY_MS || 1000);
+
 export const DATABASE_URL = process.env.DATABASE_URL;
 export const PGSSLMODE = process.env.PGSSLMODE;
