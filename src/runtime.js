@@ -3,6 +3,12 @@ import { getRuntime, setRuntime, resetRuntime } from "./db.js";
 import { postToBubble } from "./bubble.js";
 import { MAX_ACCUMULATE_SECONDS } from "./config.js";
 
+const MIN_DELTA_SECONDS = 0;
+const MS_TO_SECONDS = 1000;
+
+/**
+ * Handle runtime tracking and post session-end events when appropriate
+ */
 export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
   const nowIso = nowUtc();
   const parsed = parseEquipStatus(normalized.equipmentStatus);
@@ -25,7 +31,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
 
   const isRunning = !!parsed.isRunning;
 
-  // idle -> running
+  // Transition: idle -> running
   if (!rt.is_running && isRunning) {
     await setRuntime(hvac_id, {
       is_running: true,
@@ -38,25 +44,33 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
     return { postedSessionEnd: false };
   }
 
-  // running -> running
+  // Continuing: running -> running
   if (rt.is_running && isRunning) {
     const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
-    const deltaSec = Math.min(Math.max(0, Math.round((Date.now() - lastTick) / 1000)), MAX_ACCUMULATE_SECONDS);
+    const deltaSec = Math.min(
+      Math.max(MIN_DELTA_SECONDS, Math.round((Date.now() - lastTick) / MS_TO_SECONDS)), 
+      MAX_ACCUMULATE_SECONDS
+    );
     const newTotal = (rt.current_session_seconds || 0) + deltaSec;
+    
     await setRuntime(hvac_id, {
       current_session_seconds: newTotal,
       last_tick_at: nowIso,
       last_running_mode: currentMode || rt.last_running_mode,
       last_equipment_status: parsed.raw || rt.last_equipment_status,
     });
+    
     console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s) mode=${currentMode || rt.last_running_mode || "n/a"} status="${parsed.raw}"`);
     return { postedSessionEnd: false };
   }
 
-  // running -> idle
+  // Transition: running -> idle
   if (rt.is_running && !isRunning) {
     const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
-    const deltaSec = Math.min(Math.max(0, Math.round((Date.now() - lastTick) / 1000)), MAX_ACCUMULATE_SECONDS);
+    const deltaSec = Math.min(
+      Math.max(MIN_DELTA_SECONDS, Math.round((Date.now() - lastTick) / MS_TO_SECONDS)), 
+      MAX_ACCUMULATE_SECONDS
+    );
     const finalTotal = (rt.current_session_seconds || 0) + deltaSec;
 
     const lastMode = rt.last_running_mode || currentMode || null;
@@ -78,10 +92,19 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
     };
 
     console.log(`[${hvac_id}] ⏹️ session END ${finalTotal}s; lastMode=${lastMode || "n/a"} lastStatus="${lastEquipmentStatus}"`);
-    await postToBubble(payload, "session-end");
-    await resetRuntime(hvac_id);
-    return { postedSessionEnd: true };
+    
+    try {
+      await postToBubble(payload, "session-end");
+      await resetRuntime(hvac_id);
+      return { postedSessionEnd: true };
+    } catch (e) {
+      console.error(`[${hvac_id}] ✗ Failed to post session end:`, e.message);
+      // Still reset runtime to prevent stale data
+      await resetRuntime(hvac_id);
+      throw e;
+    }
   }
 
+  // idle -> idle (no change)
   return { postedSessionEnd: false };
 }
