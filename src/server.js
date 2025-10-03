@@ -1,121 +1,89 @@
-import { 
-  PORT, 
-  CONNECTIVITY_CHECK_EVERY_MS, 
-  REACHABILITY_STALE_MS, 
-  PUBLISH_CONNECTIVITY, 
-  POLL_INTERVAL_MS, 
-  BUBBLE_THERMOSTAT_UPDATES_URL 
-} from "./config.js";
-import { ensureSchema, pool, markUnreachableIfStale, closePool } from "./db.js";
-import { buildServer } from "./server.js";
-import { startPoller, stopPoller } from "./poller.js";
-import { postConnectivityChange } from "./bubble.js";
+import express from "express";
+import { pool, upsertTokens } from "./db.js";
+import { nowUtc } from "./util.js";
 
-let connectivityInterval;
-let isShuttingDown = false;
+export function buildServer() {
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
 
-async function connectivityScanner() {
-  if (isShuttingDown) return;
-  
-  try {
-    const { rows } = await pool.query(`SELECT hvac_id, last_seen_at, is_reachable FROM ecobee_runtime`);
-    for (const r of rows) {
-      if (isShuttingDown) break;
+  app.get("/health", async (_req, res) => {
+    try {
+      await pool.query("SELECT 1");
+      res.json({ ok: true, time: nowUtc() });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.post("/ecobee/link", async (req, res) => {
+    try {
+      const { user_id, hvac_id, access_token, refresh_token, expires_in, scope } = req.body || {};
       
-      const { flipped, userId } = await markUnreachableIfStale(r.hvac_id, r.last_seen_at, REACHABILITY_STALE_MS);
-      if (flipped && userId && PUBLISH_CONNECTIVITY) {
-        await postConnectivityChange({ 
-          userId, 
-          hvac_id: r.hvac_id, 
-          isReachable: false, 
-          reason: "stale_timeout" 
-        });
+      // Validate required fields
+      if (!user_id || typeof user_id !== 'string' || !user_id.trim()) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing user_id" });
       }
+      
+      if (!hvac_id || typeof hvac_id !== 'string' || !hvac_id.trim()) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing hvac_id" });
+      }
+      
+      if (!access_token || typeof access_token !== 'string' || !access_token.trim()) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing access_token" });
+      }
+      
+      if (!refresh_token || typeof refresh_token !== 'string' || !refresh_token.trim()) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing refresh_token" });
+      }
+      
+      if (typeof expires_in !== 'number' || expires_in <= 0) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing expires_in (must be positive number)" });
+      }
+      
+      await upsertTokens({ 
+        user_id: user_id.trim(), 
+        hvac_id: hvac_id.trim(), 
+        access_token: access_token.trim(), 
+        refresh_token: refresh_token.trim(), 
+        expires_in, 
+        scope 
+      });
+      
+      console.log(`[${hvac_id.trim()}] 🔗 link/upsert from Bubble @ ${nowUtc()}`);
+      res.json({ ok: true, saved: true });
+    } catch (e) {
+      console.error("link error:", e);
+      res.status(400).json({ ok: false, error: e.message });
     }
-  } catch (e) {
-    if (!isShuttingDown) {
-      console.warn("connectivity scan error:", e.message);
+  });
+
+  app.post("/ecobee/unlink", async (req, res) => {
+    try {
+      const { user_id, hvac_id } = req.body || {};
+      
+      if (!user_id || typeof user_id !== 'string' || !user_id.trim()) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing user_id" });
+      }
+      
+      if (!hvac_id || typeof hvac_id !== 'string' || !hvac_id.trim()) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing hvac_id" });
+      }
+      
+      const trimmedUserId = user_id.trim();
+      const trimmedHvacId = hvac_id.trim();
+      
+      await pool.query(`DELETE FROM ecobee_tokens WHERE user_id=$1 AND hvac_id=$2`, [trimmedUserId, trimmedHvacId]);
+      await pool.query(`DELETE FROM ecobee_last_state WHERE hvac_id=$1`, [trimmedHvacId]);
+      await pool.query(`DELETE FROM ecobee_runtime WHERE hvac_id=$1`, [trimmedHvacId]);
+      await pool.query(`DELETE FROM ecobee_revisions WHERE hvac_id=$1`, [trimmedHvacId]);
+      
+      console.log(`[${trimmedHvacId}] 🗑️ unlink cleanup @ ${nowUtc()}`);
+      res.json({ ok: true, removed: true });
+    } catch (e) {
+      console.error("unlink error:", e);
+      res.status(500).json({ ok: false, error: e.message });
     }
-  }
+  });
+
+  return app;
 }
-
-(async () => {
-  try {
-    // Validate configuration
-    if (!BUBBLE_THERMOSTAT_UPDATES_URL || /your-bubble-app\.com/.test(BUBBLE_THERMOSTAT_UPDATES_URL)) {
-      console.error("❌ BUBBLE_THERMOSTAT_UPDATES_URL is not set to a real Bubble URL.");
-    }
-
-    // Initialize database
-    await ensureSchema();
-    console.log("✅ Database schema ready");
-
-    // Start HTTP server
-    const app = buildServer();
-    const srv = app.listen(PORT, () => console.log(`✅ Ecobee summary-driven poller on :${PORT}`));
-
-    // Start poller
-    startPoller(POLL_INTERVAL_MS);
-    console.log(`✅ Poller started (interval: ${POLL_INTERVAL_MS}ms)`);
-
-    // Start connectivity staleness scanner
-    connectivityInterval = setInterval(connectivityScanner, CONNECTIVITY_CHECK_EVERY_MS);
-    console.log(`✅ Connectivity scanner started (interval: ${CONNECTIVITY_CHECK_EVERY_MS}ms)`);
-
-    // Graceful shutdown handler
-    const shutdown = (signal) => async () => {
-      if (isShuttingDown) return;
-      isShuttingDown = true;
-      
-      console.log(`\n${signal} received, shutting down gracefully...`);
-      
-      try {
-        // Stop accepting new work
-        console.log("⏸️  Stopping poller...");
-        stopPoller();
-        
-        console.log("⏸️  Stopping connectivity scanner...");
-        if (connectivityInterval) {
-          clearInterval(connectivityInterval);
-        }
-        
-        // Close HTTP server (waits for existing connections)
-        console.log("⏸️  Closing HTTP server...");
-        await new Promise((resolve, reject) => {
-          srv.close((err) => {
-            if (err) reject(err);
-            else resolve();
-          });
-        });
-        
-        // Close database pool
-        console.log("⏸️  Closing database pool...");
-        await closePool();
-        
-        console.log("✅ Graceful shutdown complete");
-        process.exit(0);
-      } catch (err) {
-        console.error("❌ Error during shutdown:", err);
-        process.exit(1);
-      }
-    };
-
-    process.on("SIGINT", shutdown("SIGINT"));
-    process.on("SIGTERM", shutdown("SIGTERM"));
-    
-    // Handle uncaught errors
-    process.on("uncaughtException", (err) => {
-      console.error("❌ Uncaught exception:", err);
-      shutdown("UNCAUGHT_EXCEPTION")();
-    });
-    
-    process.on("unhandledRejection", (reason, promise) => {
-      console.error("❌ Unhandled rejection at:", promise, "reason:", reason);
-      shutdown("UNHANDLED_REJECTION")();
-    });
-    
-  } catch (err) {
-    console.error("❌ Fatal startup error:", err);
-    process.exit(1);
-  }
-})();
