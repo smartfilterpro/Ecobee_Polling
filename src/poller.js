@@ -119,49 +119,79 @@ async function processThermostat(row) {
     
     // Mark seen and check for connectivity transition (atomic operation)
     const { wasUnreachable, userId } = await markSeenAndGetTransition(hvac_id);
-    if (wasUnreachable && userId) {
-      // Post to both Bubble AND Core
-      await postConnectivityChange({ userId, hvac_id, isReachable: true, reason: "api_seen" });
-      
-      // Post to Core Ingest
-      const corePayload = buildCorePayload({
-        deviceKey: hvac_id,
-        userId,
-        deviceName: null, // Will be enriched when we fetch details
-        eventType: 'CONNECTIVITY_CHANGE',
-        equipmentStatus: 'OFF',
-        previousStatus: 'OFFLINE',
-        isActive: true,
-        mode: 'off',
-        runtimeSeconds: null,
-        temperatureF: null,
-        heatSetpoint: null,
-        coolSetpoint: null,
-        observedAt: new Date(),
-        sourceEventId: uuidv4(),
-        payloadRaw: { connectivity: 'ONLINE', reason: 'api_seen' }
-      });
-      
-      console.log(`[${hvac_id}] 🟢 Device reconnected via API - posting to Core`);
-      await postToCoreIngestAsync(corePayload, "connectivity-online").catch(e =>
-        console.error(`[${hvac_id}] Failed to post connectivity to Core:`, e.message)
-      );
-    }
-
+    
     const statusMap = mapStatusFromSummary(summary);
     const revMap = mapRevisionFromSummary(summary);
     const equipStatus = statusMap.get(hvac_id) ?? "";
     const currentRev = revMap.get(hvac_id) ?? "";
     
-    // Parse Ecobee's internal connectivity for logging only (we don't use this for reachability)
+    // ✅ Use Ecobee's actual connected status - this tells us if the THERMOSTAT is online
     const isConnectedToEcobee = parseConnectedFromRevision(currentRev);
     
     const prevRev = await getLastRevision(hvac_id);
     const rt = await getRuntime(hvac_id);
     
-    // ✅ If we got an API response, the device IS reachable to us
-    // We don't trust Ecobee's "connected" field as it can be stale
-    const isReachable = true;
+    // ✅ is_reachable = is the THERMOSTAT connected to Ecobee's cloud?
+    const isReachable = isConnectedToEcobee;
+    
+    // Check if thermostat connectivity changed
+    const prevReachable = rt?.is_reachable;
+    if (prevReachable !== null && prevReachable !== undefined && prevReachable !== isReachable) {
+      // Thermostat connectivity changed - post to both Bubble and Core
+      if (isReachable) {
+        // Thermostat came back online
+        await postConnectivityChange({ userId: user_id, hvac_id, isReachable: true, reason: "thermostat_reconnected" });
+        
+        const corePayload = buildCorePayload({
+          deviceKey: hvac_id,
+          userId: user_id,
+          deviceName: null,
+          eventType: 'CONNECTIVITY_CHANGE',
+          equipmentStatus: 'OFF',
+          previousStatus: 'OFFLINE',
+          isActive: true,
+          mode: 'off',
+          runtimeSeconds: null,
+          temperatureF: null,
+          heatSetpoint: null,
+          coolSetpoint: null,
+          observedAt: new Date(),
+          sourceEventId: uuidv4(),
+          payloadRaw: { connectivity: 'ONLINE', reason: 'thermostat_reconnected' }
+        });
+        
+        console.log(`[${hvac_id}] 🟢 Thermostat reconnected to Ecobee - posting to Core`);
+        await postToCoreIngestAsync(corePayload, "connectivity-online").catch(e =>
+          console.error(`[${hvac_id}] Failed to post connectivity to Core:`, e.message)
+        );
+      } else {
+        // Thermostat went offline
+        await postConnectivityChange({ userId: user_id, hvac_id, isReachable: false, reason: "thermostat_disconnected" });
+        
+        const corePayload = buildCorePayload({
+          deviceKey: hvac_id,
+          userId: user_id,
+          deviceName: null,
+          eventType: 'CONNECTIVITY_CHANGE',
+          equipmentStatus: 'OFF',
+          previousStatus: 'ONLINE',
+          isActive: false,
+          mode: 'off',
+          runtimeSeconds: null,
+          temperatureF: null,
+          heatSetpoint: null,
+          coolSetpoint: null,
+          observedAt: new Date(),
+          sourceEventId: uuidv4(),
+          payloadRaw: { connectivity: 'OFFLINE', reason: 'thermostat_disconnected' }
+        });
+        
+        console.log(`[${hvac_id}] 🔴 Thermostat disconnected from Ecobee - posting to Core`);
+        await postToCoreIngestAsync(corePayload, "connectivity-offline").catch(e =>
+          console.error(`[${hvac_id}] Failed to post connectivity to Core:`, e.message)
+        );
+      }
+    }
 
     const parsed = parseEquipStatus(equipStatus);
     console.log(
@@ -179,7 +209,7 @@ async function processThermostat(row) {
         console.warn(`[${hvac_id}] ⚠️ details fetch failed:`, e?.response?.data || e.message);
       }
 
-      let normalized = normalizeFromDetails({ user_id, hvac_id, isReachable: true }, equipStatus, details);
+      let normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details);
 
       // Handle runtime (may post session-end to Core + Bubble)
       const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
@@ -262,7 +292,7 @@ async function processThermostat(row) {
         desiredCoolF: null,
         ok: true,
         ts: nowUtc(),
-        isReachable: true // ✅ We got API response = reachable
+        isReachable // ✅ Use Ecobee's connected status
       };
 
       const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
