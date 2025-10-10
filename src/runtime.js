@@ -67,7 +67,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       payloadRaw: normalized
     });
 
-    // Post to both Core and Bubble (non-blocking)
+    // Post to Core (non-blocking)
     await Promise.allSettled([
       postToCoreIngestAsync(corePayload, "session-start")
     ]);
