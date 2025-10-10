@@ -137,7 +137,9 @@ async function processThermostat(row) {
     // Check if thermostat connectivity changed
     const prevReachable = rt?.is_reachable;
     if (prevReachable !== null && prevReachable !== undefined && prevReachable !== isReachable) {
-      // Thermostat connectivity changed - post to both Bubble and Core
+      // Thermostat connectivity changed - update DB immediately and post to Bubble + Core
+      await setRuntime(hvac_id, { is_reachable: isReachable });
+      
       if (isReachable) {
         // Thermostat came back online
         await postConnectivityChange({ userId: user_id, hvac_id, isReachable: true, reason: "thermostat_reconnected" });
