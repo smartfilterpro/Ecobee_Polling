@@ -43,9 +43,9 @@ export function parseConnectedFromRevision(revisionString) {
 
 /**
  * Normalize device data from Ecobee details API
- * If isReachable is not explicitly provided, default to TRUE since we got an API response
+ * isReachable should be provided based on Ecobee's connected field
  */
-export function normalizeFromDetails({ user_id, hvac_id, isReachable = true }, equipStatus, details) {
+export function normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details) {
   const parsed = parseEquipStatus(equipStatus);
   let actualTemperatureF = null, desiredHeatF = null, desiredCoolF = null, thermostatName = null, hvacMode = null;
 
