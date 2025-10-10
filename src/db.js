@@ -68,6 +68,50 @@ export async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_last_seen ON ecobee_runtime(last_seen_at);`);
 }
 
+/**
+ * Get last known telemetry for backfilling Core events
+ */
+export async function getBackfillState(hvac_id) {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        hvac_id,
+        is_running,
+        current_session_started_at,
+        last_running_mode,
+        last_equipment_status,
+        is_reachable,
+        last_seen_at
+      FROM ecobee_runtime 
+      WHERE hvac_id = $1
+    `, [hvac_id]);
+    
+    if (!rows[0]) return null;
+    
+    // Try to get last telemetry from last_state
+    const { rows: stateRows } = await pool.query(`
+      SELECT last_payload 
+      FROM ecobee_last_state 
+      WHERE hvac_id = $1
+    `, [hvac_id]);
+    
+    const lastPayload = stateRows[0]?.last_payload || {};
+    
+    return {
+      ...rows[0],
+      last_temperature: lastPayload.actualTemperatureF ?? null,
+      last_humidity: null, // Ecobee doesn't provide humidity in standard API
+      last_heat_setpoint: lastPayload.desiredHeatF ?? null,
+      last_cool_setpoint: lastPayload.desiredCoolF ?? null,
+      current_mode: rows[0].last_running_mode || 'off',
+      current_equipment_status: rows[0].last_equipment_status || 'OFF'
+    };
+  } catch (err) {
+    console.error('[getBackfillState] error:', err.message);
+    return null;
+  }
+}
+
 export async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope }) {
   if (!user_id || !hvac_id || !access_token || !refresh_token || !expires_in) {
     throw new Error("Missing required fields for token upsert.");
