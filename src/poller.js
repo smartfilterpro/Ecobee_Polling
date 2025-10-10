@@ -6,6 +6,7 @@ import {
   getLastRevision,
   setLastRevision,
   getRuntime,
+  setRuntime,
   getLastHash,
   setLastState,
   pool
