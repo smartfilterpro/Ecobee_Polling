@@ -10,6 +10,8 @@ import { ensureSchema, pool, markUnreachableIfStale, closePool } from "./db.js";
 import { buildServer } from "./server.js";
 import { startPoller, stopPoller } from "./poller.js";
 import { postConnectivityChange } from "./bubble.js";
+import { buildCorePayload, postToCoreIngestAsync } from "./coreIngest.js";
+import { v4 as uuidv4 } from "uuid";
 
 let connectivityInterval;
 let isShuttingDown = false;
@@ -23,13 +25,40 @@ async function connectivityScanner() {
       if (isShuttingDown) break;
       
       const { flipped, userId } = await markUnreachableIfStale(r.hvac_id, r.last_seen_at, REACHABILITY_STALE_MS);
-      if (flipped && userId && PUBLISH_CONNECTIVITY) {
-        await postConnectivityChange({ 
-          userId, 
-          hvac_id: r.hvac_id, 
-          isReachable: false, 
-          reason: "stale_timeout" 
+      if (flipped && userId) {
+        // Post to Bubble
+        if (PUBLISH_CONNECTIVITY) {
+          await postConnectivityChange({ 
+            userId, 
+            hvac_id: r.hvac_id, 
+            isReachable: false, 
+            reason: "stale_timeout" 
+          });
+        }
+        
+        // Post to Core
+        const corePayload = buildCorePayload({
+          deviceKey: r.hvac_id,
+          userId,
+          deviceName: null,
+          eventType: 'CONNECTIVITY_CHANGE',
+          equipmentStatus: 'OFF',
+          previousStatus: 'ONLINE',
+          isActive: false,
+          mode: 'off',
+          runtimeSeconds: null,
+          temperatureF: null,
+          heatSetpoint: null,
+          coolSetpoint: null,
+          observedAt: new Date(),
+          sourceEventId: uuidv4(),
+          payloadRaw: { connectivity: 'OFFLINE', reason: 'stale_timeout' }
         });
+        
+        console.log(`[${r.hvac_id}] 🔴 Device marked offline (stale) - posting to Core`);
+        await postToCoreIngestAsync(corePayload, "connectivity-offline").catch(e =>
+          console.error(`[${r.hvac_id}] Failed to post connectivity to Core:`, e.message)
+        );
       }
     }
   } catch (e) {
