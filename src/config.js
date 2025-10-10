@@ -1,6 +1,7 @@
 export const PORT = Number(process.env.PORT || 3000);
 
 export const BUBBLE_THERMOSTAT_UPDATES_URL = (process.env.BUBBLE_THERMOSTAT_UPDATES_URL || "").trim();
+export const CORE_INGEST_URL = (process.env.CORE_INGEST_URL || "https://core-ingest-ingest.up.railway.app").trim();
 
 export const ECOBEE_CLIENT_ID = (process.env.ECOBEE_CLIENT_ID || "").trim();
 export const ECOBEE_TOKEN_URL = "https://api.ecobee.com/token";
@@ -20,6 +21,8 @@ export const POLL_CONCURRENCY = Math.max(1, Number(process.env.POLL_CONCURRENCY 
 // Retry configuration
 export const BUBBLE_POST_RETRIES = Number(process.env.BUBBLE_POST_RETRIES || 3);
 export const BUBBLE_POST_RETRY_DELAY_MS = Number(process.env.BUBBLE_POST_RETRY_DELAY_MS || 1000);
+export const CORE_POST_RETRIES = Number(process.env.CORE_POST_RETRIES || 3);
+export const CORE_POST_RETRY_DELAY_MS = Number(process.env.CORE_POST_RETRY_DELAY_MS || 1000);
 
 export const DATABASE_URL = process.env.DATABASE_URL;
 export const PGSSLMODE = process.env.PGSSLMODE;
