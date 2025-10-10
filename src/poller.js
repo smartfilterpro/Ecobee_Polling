@@ -22,6 +22,8 @@ import {
 } from "./normalize.js";
 import { handleRuntimeAndMaybePost } from "./runtime.js";
 import { postToBubble, postConnectivityChange } from "./bubble.js";
+import { buildCorePayload, postToCoreIngestAsync } from "./coreIngest.js";
+import { v4 as uuidv4 } from "uuid";
 import { ERROR_BACKOFF_MS, POLL_CONCURRENCY } from "./config.js";
 
 /**
@@ -79,6 +81,29 @@ async function fetchSummaryWithRetry(row, access_token, refresh_token) {
 }
 
 /**
+ * Detect significant state changes that should trigger a Core post
+ */
+function hasSignificantStateChange(prev, current) {
+  if (!prev) return true; // First time seeing this device
+  
+  // Temperature change > 1°F
+  const tempChanged = prev.actualTemperatureF && current.actualTemperatureF &&
+    Math.abs(prev.actualTemperatureF - current.actualTemperatureF) > 1;
+  
+  // Setpoint changes
+  const heatSetpointChanged = prev.desiredHeatF !== current.desiredHeatF;
+  const coolSetpointChanged = prev.desiredCoolF !== current.desiredCoolF;
+  
+  // Mode change
+  const modeChanged = prev.hvacMode !== current.hvacMode;
+  
+  // Connectivity change
+  const reachabilityChanged = prev.isReachable !== current.isReachable;
+  
+  return tempChanged || heatSetpointChanged || coolSetpointChanged || modeChanged || reachabilityChanged;
+}
+
+/**
  * Process a single thermostat
  */
 async function processThermostat(row) {
@@ -111,7 +136,7 @@ async function processThermostat(row) {
 
     const parsed = parseEquipStatus(equipStatus);
     console.log(
-      `[${hvac_id}] 🔥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning} connected=${isConnectedToEcobee} reachable=${isReachable}`
+      `[${hvac_id}] 📥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning} connected=${isConnectedToEcobee} reachable=${isReachable}`
     );
 
     const revisionChanged = !!currentRev && currentRev !== prevRev;
@@ -127,22 +152,66 @@ async function processThermostat(row) {
 
       let normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details);
 
-      // Handle runtime (may post session-end)
+      // Handle runtime (may post session-end to Core + Bubble)
       const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
+
+      // Get previous state for comparison
+      const lastHash = await getLastHash(hvac_id);
+      
+      // Retrieve last payload from database for comparison
+      let lastStateData = null;
+      try {
+        const { rows } = await pool.query(
+          `SELECT last_payload FROM ecobee_last_state WHERE hvac_id = $1`,
+          [hvac_id]
+        );
+        lastStateData = rows[0]?.last_payload || null;
+      } catch (e) {
+        console.warn(`[${hvac_id}] Could not retrieve last state for comparison`);
+      }
+
+      // Check if there's a significant state change (temp, setpoints, mode, etc.)
+      const shouldPostStateChange = hasSignificantStateChange(lastStateData, normalized);
 
       // Dedupe state-change by hash (ignore runtimeSeconds)
       const payloadForHash = { ...normalized, runtimeSeconds: null };
       const newHash = sha(payloadForHash);
-      const lastHash = await getLastHash(hvac_id);
-      const shouldPostStateChange = !runtimeResult.postedSessionEnd && newHash !== lastHash;
+      const hasHashChanged = newHash !== lastHash;
 
-      if (shouldPostStateChange) {
+      // Post to Core ONLY if significant state change AND not already posted by runtime handler
+      if (shouldPostStateChange && hasHashChanged && !runtimeResult.postedSessionEnd) {
+        const corePayload = buildCorePayload({
+          deviceKey: hvac_id,
+          userId: user_id,
+          deviceName: normalized.thermostatName,
+          eventType: 'STATE_UPDATE',
+          equipmentStatus: parsed.isCooling ? 'COOLING' : parsed.isHeating ? 'HEATING' : parsed.isFanOnly ? 'FAN' : 'OFF',
+          previousStatus: lastStateData?.equipmentStatus || 'UNKNOWN',
+          isActive: !!parsed.isRunning,
+          mode: normalized.hvacMode,
+          runtimeSeconds: null, // No runtime on state updates
+          temperatureF: normalized.actualTemperatureF,
+          heatSetpoint: normalized.desiredHeatF,
+          coolSetpoint: normalized.desiredCoolF,
+          observedAt: new Date(),
+          sourceEventId: uuidv4(),
+          payloadRaw: normalized
+        });
+
+        try {
+          await postToCoreIngestAsync(corePayload, "state-update");
+        } catch (e) {
+          console.error(`[${hvac_id}] ✗ Failed to post state update to Core:`, e.message);
+        }
+      }
+
+      // Post to Bubble only if hash changed and wasn't a session-end
+      if (hasHashChanged && !runtimeResult.postedSessionEnd) {
         try {
           await postToBubble({ ...normalized, runtimeSeconds: null }, "state-change");
-          // Only update state after successful post
           await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
         } catch (e) {
-          console.error(`[${hvac_id}] ✗ Failed to post state change, state not updated:`, e.message);
+          console.error(`[${hvac_id}] ✗ Failed to post state change to Bubble:`, e.message);
           throw e;
         }
       } else if (runtimeResult.postedSessionEnd) {
