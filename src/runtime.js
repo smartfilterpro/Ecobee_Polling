@@ -9,8 +9,8 @@ const MIN_DELTA_SECONDS = 0;
 const MS_TO_SECONDS = 1000;
 
 /**
- * Handle runtime tracking and post session-end events when appropriate
- * Now posts to BOTH Core Ingest AND Bubble
+ * Handle runtime tracking and post to Core only on START/END
+ * Post to Bubble only on session END
  */
 export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
   const nowIso = nowUtc();
@@ -35,7 +35,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
   const isRunning = !!parsed.isRunning;
   const isReachable = normalized.isReachable !== false; // default to true if undefined
 
-  // If device is unreachable and has a running session, end it
+  // If device is unreachable and has a running session, end it immediately
   if (!isReachable && rt.is_running) {
     const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
     const deltaSec = Math.min(
@@ -114,17 +114,17 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
 
     console.log(`[${hvac_id}] ▶️ session START @ ${nowIso} (mode=${currentMode || "n/a"}, status="${parsed.raw}")`);
 
-    // Post to Core Ingest - SESSION START
+    // Post to Core Ingest ONLY - SESSION START (no runtime_seconds)
     const corePayload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
       deviceName: normalized.thermostatName,
-      eventType: `${parsed.raw.toUpperCase()}_ON`,
+      eventType: `${currentMode?.toUpperCase() || 'UNKNOWN'}_START`,
       equipmentStatus: parsed.isCooling ? 'COOLING' : parsed.isHeating ? 'HEATING' : 'FAN',
       previousStatus: 'OFF',
       isActive: true,
       mode: currentMode,
-      runtimeSeconds: null,
+      runtimeSeconds: null, // ✅ NO runtime on start
       temperatureF: normalized.actualTemperatureF,
       heatSetpoint: normalized.desiredHeatF,
       coolSetpoint: normalized.desiredCoolF,
@@ -133,7 +133,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       payloadRaw: normalized
     });
 
-    // Post to Core (non-blocking)
+    // Post to Core only (non-blocking)
     await Promise.allSettled([
       postToCoreIngestAsync(corePayload, "session-start")
     ]);
@@ -159,29 +159,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
 
     console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s) mode=${currentMode || rt.last_running_mode || "n/a"} status="${parsed.raw}"`);
 
-    // Post to Core Ingest - SESSION TICK
-    const corePayload = buildCorePayload({
-      deviceKey: hvac_id,
-      userId: user_id,
-      deviceName: normalized.thermostatName,
-      eventType: 'STATUS_UPDATE',
-      equipmentStatus: parsed.isCooling ? 'COOLING' : parsed.isHeating ? 'HEATING' : 'FAN',
-      previousStatus: rt.last_equipment_status || 'UNKNOWN',
-      isActive: true,
-      mode: currentMode || rt.last_running_mode,
-      runtimeSeconds: newTotal,
-      temperatureF: normalized.actualTemperatureF,
-      heatSetpoint: normalized.desiredHeatF,
-      coolSetpoint: normalized.desiredCoolF,
-      observedAt: new Date(nowIso),
-      sourceEventId: uuidv4(),
-      payloadRaw: normalized
-    });
-
-    await Promise.allSettled([
-      postToCoreIngestAsync(corePayload, "session-tick")
-    ]);
-
+    // ✅ DON'T POST TO CORE ON TICKS - just update local state
     return { postedSessionEnd: false };
   }
 
@@ -206,7 +184,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
     const bubblePayload = {
       ...normalized,
       isRunning: false,
-      runtimeSeconds: finalTotal,
+      runtimeSeconds: finalTotal, // ✅ Runtime ONLY on END
       lastMode,
       lastIsCooling,
       lastIsHeating,
@@ -224,7 +202,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       previousStatus: lastEquipmentStatus,
       isActive: false,
       mode: 'off',
-      runtimeSeconds: finalTotal,
+      runtimeSeconds: finalTotal, // ✅ Runtime ONLY on END
       temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
       heatSetpoint: normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null,
       coolSetpoint: normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null,
@@ -236,7 +214,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
     console.log(`[${hvac_id}] ⏹️ session END ${finalTotal}s; lastMode=${lastMode || "n/a"} lastStatus="${lastEquipmentStatus}"`);
 
     try {
-      // Post to BOTH Core and Bubble
+      // Post to BOTH Core and Bubble ONLY on session END
       await Promise.allSettled([
         postToCoreIngestAsync(corePayload, "session-end"),
         postToBubble(bubblePayload, "session-end")
