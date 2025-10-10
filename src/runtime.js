@@ -33,6 +33,72 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
   }
 
   const isRunning = !!parsed.isRunning;
+  const isReachable = normalized.isReachable !== false; // default to true if undefined
+
+  // If device is unreachable and has a running session, end it
+  if (!isReachable && rt.is_running) {
+    const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
+    const deltaSec = Math.min(
+      Math.max(MIN_DELTA_SECONDS, Math.round((Date.now() - lastTick) / MS_TO_SECONDS)),
+      MAX_ACCUMULATE_SECONDS
+    );
+    const finalTotal = (rt.current_session_seconds || 0) + deltaSec;
+
+    const lastMode = rt.last_running_mode || currentMode || null;
+    const lastEquipmentStatus = rt.last_equipment_status || parsed.raw || "";
+    const backfill = await getBackfillState(hvac_id);
+
+    const bubblePayload = {
+      ...normalized,
+      isRunning: false,
+      runtimeSeconds: finalTotal,
+      lastMode,
+      lastIsCooling: lastMode === "cooling",
+      lastIsHeating: lastMode === "heating",
+      lastIsFanOnly: lastMode === "fanonly",
+      lastEquipmentStatus,
+      isReachable: false
+    };
+
+    const corePayload = buildCorePayload({
+      deviceKey: hvac_id,
+      userId: user_id,
+      deviceName: normalized.thermostatName,
+      eventType: 'OFFLINE_SESSION_END',
+      equipmentStatus: 'OFF',
+      previousStatus: lastEquipmentStatus,
+      isActive: false,
+      mode: 'off',
+      runtimeSeconds: finalTotal,
+      temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
+      heatSetpoint: normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null,
+      coolSetpoint: normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null,
+      observedAt: new Date(nowIso),
+      sourceEventId: uuidv4(),
+      payloadRaw: normalized
+    });
+
+    console.log(`[${hvac_id}] 📴 OFFLINE - ending session ${finalTotal}s; lastMode=${lastMode || "n/a"}`);
+
+    try {
+      await Promise.allSettled([
+        postToCoreIngestAsync(corePayload, "offline-session-end"),
+        postToBubble(bubblePayload, "offline-session-end")
+      ]);
+      await resetRuntime(hvac_id);
+      return { postedSessionEnd: true };
+    } catch (e) {
+      console.error(`[${hvac_id}] ✗ Failed to post offline session end:`, e.message);
+      await resetRuntime(hvac_id);
+      throw e;
+    }
+  }
+
+  // Don't accumulate runtime if device is unreachable
+  if (!isReachable) {
+    console.log(`[${hvac_id}] ⚠️ Device unreachable, skipping runtime tracking`);
+    return { postedSessionEnd: false };
+  }
 
   // Transition: idle -> running (SESSION START)
   if (!rt.is_running && isRunning) {
