@@ -48,6 +48,12 @@ export function buildCorePayload({
 
   const isoNow = (observedAt || new Date()).toISOString();
 
+  // ✅ Dynamically derive reachability instead of hardcoding true
+  let isReachable = true;
+  if (payloadRaw?.connectivity === 'OFFLINE' || payloadRaw?.isReachable === false) {
+    isReachable = false;
+  }
+
   return {
     // Identity
     device_key: deviceKey,
@@ -67,15 +73,15 @@ export function buildCorePayload({
     zip_prefix: zipPrefix,
     zip_code_prefix: zipPrefix,
 
-    // State snapshot (for devices/device_status tables)
+    // State snapshot
     last_mode: mode || null,
     last_is_cooling: equipmentStatus === 'COOLING',
     last_is_heating: equipmentStatus === 'HEATING',
     last_is_fan_only: equipmentStatus === 'FAN',
     last_equipment_status: equipmentStatus || null,
-    is_reachable: true,
+    is_reachable: isReachable, // ✅ dynamically derived
 
-    // Telemetry snapshot
+    // Telemetry
     last_temperature: temperatureF ?? null,
     temperature_f: temperatureF ?? null,
     temperature_c: temperatureC,
@@ -86,7 +92,7 @@ export function buildCorePayload({
     last_cool_setpoint: coolSetpoint ?? null,
     cool_setpoint_f: coolSetpoint ?? null,
 
-    // Event-specific fields
+    // Event
     event_type: eventType,
     is_active: !!isActive,
     equipment_status: equipmentStatus || 'OFF',
@@ -116,7 +122,7 @@ export async function postToCoreIngestAsync(payload, label = "event") {
 
   for (let attempt = 0; attempt < CORE_POST_RETRIES; attempt++) {
     try {
-      await axios.post(endpoint, payload, { 
+      await axios.post(endpoint, payload, {
         timeout: 20_000,
         headers: { 'Content-Type': 'application/json' }
       });
