@@ -153,16 +153,19 @@ async function processThermostat(row) {
     const equipStatus = statusMap.get(hvac_id) ?? "";
     const currentRev = revMap.get(hvac_id) ?? "";
     
-    // Parse actual connectivity from Ecobee's revision string
+    // Parse Ecobee's internal connectivity for logging only (we don't use this for reachability)
     const isConnectedToEcobee = parseConnectedFromRevision(currentRev);
     
     const prevRev = await getLastRevision(hvac_id);
     const rt = await getRuntime(hvac_id);
-    const isReachable = isConnectedToEcobee; // Use Ecobee's actual connected status
+    
+    // ✅ If we got an API response, the device IS reachable to us
+    // We don't trust Ecobee's "connected" field as it can be stale
+    const isReachable = true;
 
     const parsed = parseEquipStatus(equipStatus);
     console.log(
-      `[${hvac_id}] 📥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning} connected=${isConnectedToEcobee} reachable=${isReachable}`
+      `[${hvac_id}] 📥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning} ecobee_connected=${isConnectedToEcobee} reachable=${isReachable}`
     );
 
     const revisionChanged = !!currentRev && currentRev !== prevRev;
@@ -176,7 +179,7 @@ async function processThermostat(row) {
         console.warn(`[${hvac_id}] ⚠️ details fetch failed:`, e?.response?.data || e.message);
       }
 
-      let normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details);
+      let normalized = normalizeFromDetails({ user_id, hvac_id, isReachable: true }, equipStatus, details);
 
       // Handle runtime (may post session-end to Core + Bubble)
       const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
@@ -259,7 +262,7 @@ async function processThermostat(row) {
         desiredCoolF: null,
         ok: true,
         ts: nowUtc(),
-        isReachable
+        isReachable: true // ✅ We got API response = reachable
       };
 
       const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
