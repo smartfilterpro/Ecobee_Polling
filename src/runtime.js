@@ -95,9 +95,76 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
   }
 
   // Don't accumulate runtime if device is unreachable
+  // But check if we need to post a connectivity change
   if (!isReachable) {
+    // Check if reachability status changed
+    const prevReachable = rt.is_reachable;
+    if (prevReachable !== false) {
+      // Device just went offline - post connectivity change
+      const backfill = await getBackfillState(hvac_id);
+      const corePayload = buildCorePayload({
+        deviceKey: hvac_id,
+        userId: user_id,
+        deviceName: normalized.thermostatName || backfill?.device_name || null,
+        eventType: 'CONNECTIVITY_CHANGE',
+        equipmentStatus: 'OFF',
+        previousStatus: 'ONLINE',
+        isActive: false,
+        mode: 'off',
+        runtimeSeconds: null,
+        temperatureF: backfill?.last_temperature ?? null,
+        heatSetpoint: backfill?.last_heat_setpoint ?? null,
+        coolSetpoint: backfill?.last_cool_setpoint ?? null,
+        observedAt: new Date(nowIso),
+        sourceEventId: uuidv4(),
+        payloadRaw: { connectivity: 'OFFLINE', reason: 'ecobee_disconnected' }
+      });
+
+      console.log(`[${hvac_id}] 🔴 Device went OFFLINE - posting to Core`);
+      
+      await Promise.allSettled([
+        postToCoreIngestAsync(corePayload, "connectivity-offline")
+      ]);
+
+      // Update reachability in local state
+      await setRuntime(hvac_id, { is_reachable: false });
+    }
+    
     console.log(`[${hvac_id}] ⚠️ Device unreachable, skipping runtime tracking`);
     return { postedSessionEnd: false };
+  }
+
+  // Device is reachable - check if it just came back online
+  const prevReachable = rt.is_reachable;
+  if (prevReachable === false) {
+    // Device just came back online - post connectivity change
+    const backfill = await getBackfillState(hvac_id);
+    const corePayload = buildCorePayload({
+      deviceKey: hvac_id,
+      userId: user_id,
+      deviceName: normalized.thermostatName || backfill?.device_name || null,
+      eventType: 'CONNECTIVITY_CHANGE',
+      equipmentStatus: parsed.isCooling ? 'COOLING' : parsed.isHeating ? 'HEATING' : 'OFF',
+      previousStatus: 'OFFLINE',
+      isActive: isReachable,
+      mode: currentMode || 'off',
+      runtimeSeconds: null,
+      temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
+      heatSetpoint: normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null,
+      coolSetpoint: normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null,
+      observedAt: new Date(nowIso),
+      sourceEventId: uuidv4(),
+      payloadRaw: { connectivity: 'ONLINE', reason: 'ecobee_reconnected' }
+    });
+
+    console.log(`[${hvac_id}] 🟢 Device came back ONLINE - posting to Core`);
+    
+    await Promise.allSettled([
+      postToCoreIngestAsync(corePayload, "connectivity-online")
+    ]);
+
+    // Update reachability in local state
+    await setRuntime(hvac_id, { is_reachable: true });
   }
 
   // Transition: idle -> running (SESSION START)
