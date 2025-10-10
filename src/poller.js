@@ -8,6 +8,7 @@ import {
   getRuntime,
   getLastHash,
   setLastState,
+  pool
 } from "./db.js";
 import {
   refreshEcobeeTokens,
@@ -119,7 +120,32 @@ async function processThermostat(row) {
     // Mark seen and check for connectivity transition (atomic operation)
     const { wasUnreachable, userId } = await markSeenAndGetTransition(hvac_id);
     if (wasUnreachable && userId) {
+      // Post to both Bubble AND Core
       await postConnectivityChange({ userId, hvac_id, isReachable: true, reason: "api_seen" });
+      
+      // Post to Core Ingest
+      const corePayload = buildCorePayload({
+        deviceKey: hvac_id,
+        userId,
+        deviceName: null, // Will be enriched when we fetch details
+        eventType: 'CONNECTIVITY_CHANGE',
+        equipmentStatus: 'OFF',
+        previousStatus: 'OFFLINE',
+        isActive: true,
+        mode: 'off',
+        runtimeSeconds: null,
+        temperatureF: null,
+        heatSetpoint: null,
+        coolSetpoint: null,
+        observedAt: new Date(),
+        sourceEventId: uuidv4(),
+        payloadRaw: { connectivity: 'ONLINE', reason: 'api_seen' }
+      });
+      
+      console.log(`[${hvac_id}] 🟢 Device reconnected via API - posting to Core`);
+      await postToCoreIngestAsync(corePayload, "connectivity-online").catch(e =>
+        console.error(`[${hvac_id}] Failed to post connectivity to Core:`, e.message)
+      );
     }
 
     const statusMap = mapStatusFromSummary(summary);
