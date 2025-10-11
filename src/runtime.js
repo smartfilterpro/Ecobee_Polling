@@ -1,16 +1,18 @@
-import { parseEquipStatus, modeFromParsed, nowUtc, toMillis } from "./util.js";
-import { getRuntime, setRuntime, resetRuntime, getBackfillState } from "./db.js";
-import { postToBubble } from "./bubble.js";
-import { buildCorePayload, postToCoreIngestAsync } from "./coreIngest.js";
-import { MAX_ACCUMULATE_SECONDS } from "./config.js";
-import { v4 as uuidv4 } from "uuid";
+'use strict';
+
+import { v4 as uuidv4 } from 'uuid';
+import { parseEquipStatus, modeFromParsed, nowUtc, toMillis } from './util.js';
+import { getRuntime, setRuntime, resetRuntime, getBackfillState } from './db.js';
+import { postToBubble } from './bubble.js';
+import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
+import { MAX_ACCUMULATE_SECONDS } from './config.js';
 
 const MIN_DELTA_SECONDS = 0;
 const MS_TO_SECONDS = 1000;
 
 /**
- * Handle runtime tracking and post to Core only on START/END/STATE_UPDATE
- * Post to Bubble only on END
+ * Tracks runtime sessions, reachability, and state updates.
+ * Posts to Core Ingest and Bubble.io only when relevant changes occur.
  */
 export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
   const nowIso = nowUtc();
@@ -35,122 +37,133 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
   const isRunning = !!parsed.isRunning;
   const isReachable = normalized.isReachable !== false;
 
-  /* ---------------------- Device Unreachable ---------------------- */
-  if (!isReachable && rt.is_running) {
-    const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
-    const deltaSec = Math.min(
-      Math.max(MIN_DELTA_SECONDS, Math.round((Date.now() - lastTick) / MS_TO_SECONDS)),
-      MAX_ACCUMULATE_SECONDS
-    );
-    const finalTotal = (rt.current_session_seconds || 0) + deltaSec;
-
-    const lastMode = rt.last_running_mode || currentMode || null;
-    const lastEquipmentStatus = rt.last_equipment_status || parsed.raw || "";
-    const backfill = await getBackfillState(hvac_id);
-
-    const bubblePayload = {
-      ...normalized,
-      isRunning: false,
-      runtimeSeconds: finalTotal,
-      lastMode,
-      lastIsCooling: lastMode === "cooling",
-      lastIsHeating: lastMode === "heating",
-      lastIsFanOnly: lastMode === "fanonly",
-      lastEquipmentStatus,
-      isReachable: false
-    };
-
-    const corePayload = buildCorePayload({
-      deviceKey: hvac_id,
-      userId: user_id,
-      deviceName: normalized.thermostatName,
-      eventType: "OFFLINE_SESSION_END",
-      equipmentStatus: "OFF",
-      previousStatus: lastEquipmentStatus,
-      isActive: false,
-      mode: "off",
-      runtimeSeconds: finalTotal,
-      temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
-      heatSetpoint: normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null,
-      coolSetpoint: normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null,
-      observedAt: new Date(nowIso),
-      sourceEventId: uuidv4(),
-      payloadRaw: normalized
-    });
-
-    console.log(`[${hvac_id}] 📴 OFFLINE - ending session ${finalTotal}s; lastMode=${lastMode || "n/a"}`);
-
-    try {
-      await Promise.allSettled([
-        postToCoreIngestAsync(corePayload, "offline-session-end"),
-        postToBubble(bubblePayload, "offline-session-end")
-      ]);
-      await resetRuntime(hvac_id);
-      return { postedSessionEnd: true };
-    } catch (e) {
-      console.error(`[${hvac_id}] ✗ Failed to post offline session end:`, e.message);
-      await resetRuntime(hvac_id);
-      throw e;
-    }
-  }
-
-  // Reachability handling
+  /* -------------------------------------------------------------------------- */
+  /*                      DEVICE UNREACHABLE (OFFLINE HANDLING)                 */
+  /* -------------------------------------------------------------------------- */
   if (!isReachable) {
-    const prevReachable = rt.is_reachable;
-    if (prevReachable !== false) {
+    // Prevent repeated offline posts
+    if (rt.is_reachable === false) {
+      console.log(`[${hvac_id}] ⚠️ Still offline — skipping all posts`);
+      return { postedSessionEnd: false };
+    }
+
+    // End any active session first
+    if (rt.is_running) {
+      const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
+      const deltaSec = Math.min(
+        Math.max(MIN_DELTA_SECONDS, Math.round((Date.now() - lastTick) / MS_TO_SECONDS)),
+        MAX_ACCUMULATE_SECONDS
+      );
+      const finalTotal = (rt.current_session_seconds || 0) + deltaSec;
+
+      const lastMode = rt.last_running_mode || currentMode || null;
+      const lastEquipmentStatus = rt.last_equipment_status || parsed.raw || '';
       const backfill = await getBackfillState(hvac_id);
+
+      const bubblePayload = {
+        ...normalized,
+        isRunning: false,
+        runtimeSeconds: finalTotal,
+        lastMode,
+        lastIsCooling: lastMode === 'cooling',
+        lastIsHeating: lastMode === 'heating',
+        lastIsFanOnly: lastMode === 'fanonly',
+        lastEquipmentStatus,
+        isReachable: false,
+      };
+
       const corePayload = buildCorePayload({
         deviceKey: hvac_id,
         userId: user_id,
-        deviceName: normalized.thermostatName || backfill?.device_name || null,
-        eventType: "CONNECTIVITY_CHANGE",
-        equipmentStatus: "OFF",
-        previousStatus: "ONLINE",
+        deviceName: normalized.thermostatName,
+        eventType: 'OFFLINE_SESSION_END',
+        equipmentStatus: 'OFF',
+        previousStatus: lastEquipmentStatus,
         isActive: false,
-        mode: "off",
-        runtimeSeconds: null,
-        temperatureF: backfill?.last_temperature ?? null,
-        heatSetpoint: backfill?.last_heat_setpoint ?? null,
-        coolSetpoint: backfill?.last_cool_setpoint ?? null,
+        mode: 'off',
+        runtimeSeconds: finalTotal,
+        temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
+        heatSetpoint: normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null,
+        coolSetpoint: normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null,
         observedAt: new Date(nowIso),
         sourceEventId: uuidv4(),
-        payloadRaw: { connectivity: "OFFLINE", reason: "ecobee_disconnected" }
+        payloadRaw: normalized,
       });
-      console.log(`[${hvac_id}] 🔴 Device went OFFLINE - posting to Core`);
-      await postToCoreIngestAsync(corePayload, "connectivity-offline");
-      await setRuntime(hvac_id, { is_reachable: false });
-    }
-    console.log(`[${hvac_id}] ⚠️ Device unreachable, skipping runtime tracking`);
-    return { postedSessionEnd: false };
-  }
 
-  const prevReachable = rt.is_reachable;
-  if (prevReachable === false) {
+      console.log(`[${hvac_id}] 📴 OFFLINE - ending session ${finalTotal}s; lastMode=${lastMode || 'n/a'}`);
+
+      try {
+        await Promise.allSettled([
+          postToCoreIngestAsync(corePayload, 'offline-session-end'),
+          postToBubble(bubblePayload, 'offline-session-end'),
+        ]);
+        await resetRuntime(hvac_id);
+      } catch (e) {
+        console.error(`[${hvac_id}] ✗ Failed to post offline session end:`, e.message);
+        await resetRuntime(hvac_id);
+      }
+    }
+
+    // Post connectivity offline once
     const backfill = await getBackfillState(hvac_id);
     const corePayload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
       deviceName: normalized.thermostatName || backfill?.device_name || null,
-      eventType: "CONNECTIVITY_CHANGE",
-      equipmentStatus: parsed.isCooling ? "COOLING" : parsed.isHeating ? "HEATING" : "OFF",
-      previousStatus: "OFFLINE",
-      isActive: isReachable,
-      mode: currentMode || "off",
+      eventType: 'CONNECTIVITY_CHANGE',
+      equipmentStatus: 'OFF',
+      previousStatus: 'ONLINE',
+      isActive: false,
+      mode: 'off',
+      runtimeSeconds: null,
+      temperatureF: backfill?.last_temperature ?? null,
+      heatSetpoint: backfill?.last_heat_setpoint ?? null,
+      coolSetpoint: backfill?.last_cool_setpoint ?? null,
+      observedAt: new Date(nowIso),
+      sourceEventId: uuidv4(),
+      payloadRaw: { connectivity: 'OFFLINE', reason: 'ecobee_disconnected' },
+    });
+
+    console.log(`[${hvac_id}] 🔴 Device went OFFLINE - posting once to Core`);
+    await postToCoreIngestAsync(corePayload, 'connectivity-offline');
+
+    // Persist flag so next cycles know it's offline
+    await setRuntime(hvac_id, { is_reachable: false });
+    console.log(`[${hvac_id}] 🚫 Marked as offline — will not post again until online`);
+    return { postedSessionEnd: false };
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                      DEVICE ONLINE (RECOVERY HANDLING)                     */
+  /* -------------------------------------------------------------------------- */
+  if (rt.is_reachable === false && isReachable) {
+    const backfill = await getBackfillState(hvac_id);
+    const corePayload = buildCorePayload({
+      deviceKey: hvac_id,
+      userId: user_id,
+      deviceName: normalized.thermostatName || backfill?.device_name || null,
+      eventType: 'CONNECTIVITY_CHANGE',
+      equipmentStatus: parsed.isCooling ? 'COOLING' : parsed.isHeating ? 'HEATING' : 'OFF',
+      previousStatus: 'OFFLINE',
+      isActive: true,
+      mode: currentMode || 'off',
       runtimeSeconds: null,
       temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
       heatSetpoint: normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null,
       coolSetpoint: normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null,
       observedAt: new Date(nowIso),
       sourceEventId: uuidv4(),
-      payloadRaw: { connectivity: "ONLINE", reason: "ecobee_reconnected" }
+      payloadRaw: { connectivity: 'ONLINE', reason: 'ecobee_reconnected' },
     });
 
     console.log(`[${hvac_id}] 🟢 Device came back ONLINE - posting to Core`);
-    await postToCoreIngestAsync(corePayload, "connectivity-online");
+    await postToCoreIngestAsync(corePayload, 'connectivity-online');
     await setRuntime(hvac_id, { is_reachable: true });
   }
 
-  /* ---------------------- SESSION START ---------------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                              SESSION START                                 */
+  /* -------------------------------------------------------------------------- */
   if (!rt.is_running && isRunning) {
     const sessionId = uuidv4();
     await setRuntime(hvac_id, {
@@ -158,18 +171,19 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       current_session_started_at: nowIso,
       last_tick_at: nowIso,
       last_running_mode: currentMode,
-      last_equipment_status: parsed.raw
+      last_equipment_status: parsed.raw,
+      is_reachable: true,
     });
 
-    console.log(`[${hvac_id}] ▶️ session START @ ${nowIso} (mode=${currentMode || "n/a"}, status="${parsed.raw}")`);
+    console.log(`[${hvac_id}] ▶️ session START @ ${nowIso} (mode=${currentMode || 'n/a'}, status="${parsed.raw}")`);
 
     const corePayload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
       deviceName: normalized.thermostatName,
-      eventType: `${currentMode?.toUpperCase() || "UNKNOWN"}_START`,
-      equipmentStatus: parsed.isCooling ? "COOLING" : parsed.isHeating ? "HEATING" : "FAN",
-      previousStatus: "OFF",
+      eventType: `${currentMode?.toUpperCase() || 'UNKNOWN'}_START`,
+      equipmentStatus: parsed.isCooling ? 'COOLING' : parsed.isHeating ? 'HEATING' : 'FAN',
+      previousStatus: 'OFF',
       isActive: true,
       mode: currentMode,
       runtimeSeconds: null,
@@ -178,14 +192,16 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       coolSetpoint: normalized.desiredCoolF,
       observedAt: new Date(nowIso),
       sourceEventId: sessionId,
-      payloadRaw: normalized
+      payloadRaw: normalized,
     });
 
-    await postToCoreIngestAsync(corePayload, "session-start");
+    await postToCoreIngestAsync(corePayload, 'session-start');
     return { postedSessionEnd: false };
   }
 
-  /* ---------------------- SESSION TICK ---------------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                              SESSION TICK                                  */
+  /* -------------------------------------------------------------------------- */
   if (rt.is_running && isRunning) {
     const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
     const deltaSec = Math.min(
@@ -198,14 +214,16 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       current_session_seconds: newTotal,
       last_tick_at: nowIso,
       last_running_mode: currentMode || rt.last_running_mode,
-      last_equipment_status: parsed.raw || rt.last_equipment_status
+      last_equipment_status: parsed.raw || rt.last_equipment_status,
     });
 
-    console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s) mode=${currentMode || "n/a"} status="${parsed.raw}"`);
+    console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s) mode=${currentMode || 'n/a'} status="${parsed.raw}"`);
     return { postedSessionEnd: false };
   }
 
-  /* ---------------------- SESSION END ---------------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                              SESSION END                                   */
+  /* -------------------------------------------------------------------------- */
   if (rt.is_running && !isRunning) {
     const lastTick = rt.last_tick_at ? toMillis(rt.last_tick_at) : Date.now();
     const deltaSec = Math.min(
@@ -215,7 +233,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
     const finalTotal = (rt.current_session_seconds || 0) + deltaSec;
 
     const lastMode = rt.last_running_mode || currentMode || null;
-    const lastEquipmentStatus = rt.last_equipment_status || parsed.raw || "";
+    const lastEquipmentStatus = rt.last_equipment_status || parsed.raw || '';
     const backfill = await getBackfillState(hvac_id);
 
     const bubblePayload = {
@@ -223,37 +241,37 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       isRunning: false,
       runtimeSeconds: finalTotal,
       lastMode,
-      lastIsCooling: lastMode === "cooling",
-      lastIsHeating: lastMode === "heating",
-      lastIsFanOnly: lastMode === "fanonly",
+      lastIsCooling: lastMode === 'cooling',
+      lastIsHeating: lastMode === 'heating',
+      lastIsFanOnly: lastMode === 'fanonly',
       lastEquipmentStatus,
-      isReachable: rt?.is_reachable !== undefined ? rt.is_reachable : normalized.isReachable
+      isReachable: true,
     };
 
     const corePayload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
       deviceName: normalized.thermostatName,
-      eventType: "STATUS_CHANGE",
-      equipmentStatus: "OFF",
+      eventType: 'STATUS_CHANGE',
+      equipmentStatus: 'OFF',
       previousStatus: lastEquipmentStatus,
       isActive: false,
-      mode: "off",
+      mode: 'off',
       runtimeSeconds: finalTotal,
       temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
       heatSetpoint: normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null,
       coolSetpoint: normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null,
       observedAt: new Date(nowIso),
       sourceEventId: uuidv4(),
-      payloadRaw: normalized
+      payloadRaw: normalized,
     });
 
-    console.log(`[${hvac_id}] ⏹️ session END ${finalTotal}s; lastMode=${lastMode || "n/a"} lastStatus="${lastEquipmentStatus}"`);
+    console.log(`[${hvac_id}] ⏹️ session END ${finalTotal}s; lastMode=${lastMode || 'n/a'} lastStatus="${lastEquipmentStatus}"`);
 
     try {
       await Promise.allSettled([
-        postToCoreIngestAsync(corePayload, "session-end"),
-        postToBubble(bubblePayload, "session-end")
+        postToCoreIngestAsync(corePayload, 'session-end'),
+        postToBubble(bubblePayload, 'session-end'),
       ]);
       await resetRuntime(hvac_id);
       return { postedSessionEnd: true };
@@ -264,10 +282,11 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
     }
   }
 
-  /* ---------------------- IDLE STATE UPDATE ---------------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                              IDLE STATE UPDATE                             */
+  /* -------------------------------------------------------------------------- */
   if (!rt.is_running && !isRunning && isReachable && normalized.actualTemperatureF != null) {
     const backfill = await getBackfillState(hvac_id);
-
     const prevTemp = backfill?.last_temperature ?? null;
     const prevHum = backfill?.last_humidity ?? null;
 
@@ -279,25 +298,25 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
         deviceKey: hvac_id,
         userId: user_id,
         deviceName: normalized.thermostatName,
-        eventType: "STATE_UPDATE",
-        equipmentStatus: "OFF",
-        previousStatus: "OFF",
+        eventType: 'STATE_UPDATE',
+        equipmentStatus: 'OFF',
+        previousStatus: 'OFF',
         isActive: false,
-        mode: "off",
+        mode: 'off',
         runtimeSeconds: null,
         temperatureF: normalized.actualTemperatureF ?? null,
         heatSetpoint: normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null,
         coolSetpoint: normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null,
         observedAt: new Date(nowIso),
         sourceEventId: uuidv4(),
-        payloadRaw: normalized
+        payloadRaw: normalized,
       });
 
       console.log(
-        `[${hvac_id}] 🌡️ STATE_UPDATE (idle) temp=${normalized.actualTemperatureF}F humidity=${normalized.humidity ?? "—"}`
+        `[${hvac_id}] 🌡️ STATE_UPDATE (idle) temp=${normalized.actualTemperatureF}F humidity=${normalized.humidity ?? '—'}`
       );
 
-      await postToCoreIngestAsync(corePayload, "state-update");
+      await postToCoreIngestAsync(corePayload, 'state-update');
     }
   }
 
