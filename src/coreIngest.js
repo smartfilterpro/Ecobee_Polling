@@ -1,7 +1,14 @@
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
-import { CORE_INGEST_URL, CORE_POST_RETRIES, CORE_POST_RETRY_DELAY_MS } from "./config.js";
+import {
+  CORE_INGEST_URL,
+  CORE_POST_RETRIES,
+  CORE_POST_RETRY_DELAY_MS
+} from "./config.js";
 import { nowUtc, sleep } from "./util.js";
+
+// ✅ new optional import
+const CORE_API_KEY = process.env.CORE_API_KEY;
 
 /**
  * Build Core Ingest payload matching Nest pattern
@@ -11,56 +18,54 @@ export function buildCorePayload({
   userId,
   deviceName,
   // Ecobee-specific metadata
-  manufacturer = 'Ecobee',
-  model = 'Ecobee Thermostat',
-  connectionSource = 'ecobee',
-  source = 'ecobee',
-  sourceVendor = 'ecobee',
+  manufacturer = "Ecobee",
+  model = "Ecobee Thermostat",
+  connectionSource = "ecobee",
+  source = "ecobee",
+  sourceVendor = "ecobee",
   workspaceId = userId,
-  deviceType = 'thermostat',
+  deviceType = "thermostat",
   firmwareVersion = null,
   serialNumber = null,
   timezone = null,
   zipPrefix = null,
-  
+
   // Runtime state
-  eventType,              // e.g., COOLING_ON, HEATING_ON, STATUS_CHANGE, FAN_ON
-  equipmentStatus,        // HEATING/COOLING/OFF/FAN
-  previousStatus,         // previous equipment status
-  isActive,               // boolean
-  mode,                   // 'heating' | 'cooling' | 'fanonly' | 'off'
-  runtimeSeconds,         // integer or null
-  
+  eventType,
+  equipmentStatus,
+  previousStatus,
+  isActive,
+  mode,
+  runtimeSeconds,
+
   // Telemetry
-  temperatureF,           // number or null
-  humidity = null,        // Ecobee doesn't provide this in basic API
-  heatSetpoint,           // number or null
-  coolSetpoint,           // number or null
-  
+  temperatureF,
+  humidity = null,
+  heatSetpoint,
+  coolSetpoint,
+
   // Metadata
-  observedAt,             // JS Date
-  sourceEventId,          // stable session ID
-  payloadRaw              // raw event for traceability
+  observedAt,
+  sourceEventId,
+  payloadRaw
 }) {
-  const temperatureC = typeof temperatureF === 'number'
-    ? Math.round(((temperatureF - 32) * 5 / 9) * 100) / 100
-    : null;
+  const temperatureC =
+    typeof temperatureF === "number"
+      ? Math.round(((temperatureF - 32) * 5) / 9 * 100) / 100
+      : null;
 
   const isoNow = (observedAt || new Date()).toISOString();
 
-  // ✅ Dynamically derive reachability instead of hardcoding true
   let isReachable = true;
-  if (payloadRaw?.connectivity === 'OFFLINE' || payloadRaw?.isReachable === false) {
+  if (payloadRaw?.connectivity === "OFFLINE" || payloadRaw?.isReachable === false)
     isReachable = false;
-  }
 
   return {
-    // Identity
     device_key: deviceKey,
-    device_id: deviceKey, // Ecobee uses identifier as device_id
+    device_id: deviceKey,
     user_id: userId || null,
     workspace_id: workspaceId || userId || null,
-    device_name: deviceName || 'Ecobee Thermostat',
+    device_name: deviceName || "Ecobee Thermostat",
     manufacturer,
     model,
     device_type: deviceType,
@@ -73,77 +78,81 @@ export function buildCorePayload({
     zip_prefix: zipPrefix,
     zip_code_prefix: zipPrefix,
 
-    // State snapshot
     last_mode: mode || null,
-    last_is_cooling: equipmentStatus === 'COOLING',
-    last_is_heating: equipmentStatus === 'HEATING',
-    last_is_fan_only: equipmentStatus === 'FAN',
+    last_is_cooling: equipmentStatus === "COOLING",
+    last_is_heating: equipmentStatus === "HEATING",
+    last_is_fan_only: equipmentStatus === "FAN",
     last_equipment_status: equipmentStatus || null,
-    is_reachable: isReachable, // ✅ dynamically derived
+    is_reachable: isReachable,
 
-    // Telemetry
     last_temperature: temperatureF ?? null,
     temperature_f: temperatureF ?? null,
     temperature_c: temperatureC,
     last_humidity: humidity,
-    humidity: humidity,
+    humidity,
     last_heat_setpoint: heatSetpoint ?? null,
     heat_setpoint_f: heatSetpoint ?? null,
     last_cool_setpoint: coolSetpoint ?? null,
     cool_setpoint_f: coolSetpoint ?? null,
 
-    // Event
     event_type: eventType,
     is_active: !!isActive,
-    equipment_status: equipmentStatus || 'OFF',
-    previous_status: previousStatus || 'UNKNOWN',
-    runtime_seconds: typeof runtimeSeconds === 'number' ? runtimeSeconds : null,
+    equipment_status: equipmentStatus || "OFF",
+    previous_status: previousStatus || "UNKNOWN",
+    runtime_seconds: typeof runtimeSeconds === "number" ? runtimeSeconds : null,
     timestamp: isoNow,
     recorded_at: isoNow,
     observed_at: isoNow,
 
-    // Dedupe + trace
     source_event_id: sourceEventId || uuidv4(),
     payload_raw: payloadRaw || null
   };
 }
 
 /**
- * Post to Core Ingest with retry logic
+ * Securely post to Core Ingest with retries
  */
 export async function postToCoreIngestAsync(payload, label = "event") {
   if (!CORE_INGEST_URL) {
-    console.warn("[CoreIngest] CORE_INGEST_URL not set, skipping");
+    console.warn("[CoreIngest] ⚠️ CORE_INGEST_URL not set — skipping post");
     return;
   }
 
+  if (!CORE_API_KEY) {
+    console.warn("[CoreIngest] ⚠️ CORE_API_KEY missing — posting insecurely (dev only)");
+  }
+
   const endpoint = `${CORE_INGEST_URL}/ingest/v1/events:batch`;
+  const headers = {
+    "Content-Type": "application/json",
+    ...(CORE_API_KEY ? { Authorization: `Bearer ${CORE_API_KEY}` } : {})
+  };
+
+  // Core expects an array of events
+  const body = Array.isArray(payload) ? payload : [payload];
   let lastError;
 
   for (let attempt = 0; attempt < CORE_POST_RETRIES; attempt++) {
     try {
-      await axios.post(endpoint, payload, {
-        timeout: 20_000,
-        headers: { 'Content-Type': 'application/json' }
-      });
-      console.log(`[${payload.device_key}] ✓ POSTED to Core (${label}) ${nowUtc()}`);
+      await axios.post(endpoint, body, { timeout: 20_000, headers });
+      console.log(`[${body[0]?.device_key}] ✅ Posted to Core (${label}) ${nowUtc()}`);
       return;
     } catch (err) {
       lastError = err;
-      const isLastAttempt = attempt === CORE_POST_RETRIES - 1;
+      const isLast = attempt === CORE_POST_RETRIES - 1;
+      const status = err.response?.status || "unknown";
+      const msg = err.response?.data?.error || err.message;
 
-      if (isLastAttempt) {
+      if (isLast) {
         console.error(
-          `[${payload.device_key}] ✗ FAILED to post to Core after ${CORE_POST_RETRIES} attempts (${label}):`,
-          err?.response?.data || err.message
+          `[${body[0]?.device_key}] 💥 Core post failed after ${CORE_POST_RETRIES} attempts (${label}) — ${status}: ${msg}`
         );
         throw err;
       }
 
       const delayMs = CORE_POST_RETRY_DELAY_MS * Math.pow(2, attempt);
       console.warn(
-        `[${payload.device_key}] ⚠️ Core post failed (attempt ${attempt + 1}/${CORE_POST_RETRIES}), retrying in ${delayMs}ms:`,
-        err?.response?.data || err.message
+        `[${body[0]?.device_key}] ⚠️ Core post failed (attempt ${attempt + 1}/${CORE_POST_RETRIES}) [${status}] — retrying in ${delayMs}ms`
       );
       await sleep(delayMs);
     }
