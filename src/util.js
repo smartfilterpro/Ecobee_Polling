@@ -23,13 +23,12 @@ export function isExpiringSoon(expiresAtISO, thresholdSec = 120) {
  * @param {string} equipmentStatus - Raw Ecobee equipment status (e.g., "compCool1,fan", "auxHeat1", "fan")
  * @returns {object} Parsed state with standardizedState for filter health tracking
  * 
- * State Logic:
- * - Heating_Fan = heating equipment + fan (filter usage)
- * - Heating = heating equipment only (no filter usage)
- * - Cooling_Fan = cooling equipment + fan (filter usage)
- * - Cooling = cooling equipment only (no filter usage - rare)
+ * State Logic (8 states):
+ * - Cooling_Fan / Cooling = cooling equipment ± fan
+ * - Heating_Fan / Heating = primary heating (heat pump, furnace) ± fan
+ * - AuxHeat_Fan / AuxHeat = auxiliary/emergency heat ± fan (higher energy cost)
  * - Fan_only = just fan (filter usage)
- * - Fan_off = system idle (no filter usage)
+ * - Fan_off = system idle
  */
 export function parseEquipStatus(equipmentStatus) {
   try {
@@ -40,11 +39,13 @@ export function parseEquipStatus(equipmentStatus) {
     // Detect cooling compressor
     const compressorCooling = has("compcool1") || has("compcool2") || has("cooling");
     
-    // Detect heating equipment (compressor, heat pump, or auxiliary heat)
-    const compressorHeating = has("compheat1") || has("compheat2") || 
-                               has("auxheat1") || has("auxheat2") || has("auxheat3") ||
-                               has("heatpump") || has("heatpump1") || has("heatpump2") ||
-                               has("heating");
+    // Detect auxiliary/emergency heat (typically expensive electric resistance)
+    const auxHeat = has("auxheat1") || has("auxheat2") || has("auxheat3");
+    
+    // Detect primary heating equipment (heat pump, furnace)
+    const primaryHeating = has("compheat1") || has("compheat2") || 
+                           has("heatpump") || has("heatpump1") || has("heatpump2") ||
+                           has("heating");
     
     // Detect fan presence in equipment status
     const fanRunning = has("fan") || has("fanonly") || has("fanonly1");
@@ -53,6 +54,7 @@ export function parseEquipStatus(equipmentStatus) {
     let standardizedState = "Fan_off";
     let isCooling = false;
     let isHeating = false;
+    let isAuxHeat = false;
     let isFanOnly = false;
     let lastMode = null;
 
@@ -66,13 +68,23 @@ export function parseEquipStatus(equipmentStatus) {
       standardizedState = "Cooling";
       isCooling = true;
       lastMode = "cooling";
-    } else if (compressorHeating && fanRunning) {
-      // Heating with fan = filter usage
+    } else if (auxHeat && fanRunning) {
+      // Auxiliary/emergency heat with fan = filter usage + high energy cost
+      standardizedState = "AuxHeat_Fan";
+      isAuxHeat = true;
+      lastMode = "auxheat";
+    } else if (auxHeat && !fanRunning) {
+      // Auxiliary heat without fan = rare (hydronic aux heat)
+      standardizedState = "AuxHeat";
+      isAuxHeat = true;
+      lastMode = "auxheat";
+    } else if (primaryHeating && fanRunning) {
+      // Primary heating with fan = filter usage
       standardizedState = "Heating_Fan";
       isHeating = true;
       lastMode = "heating";
-    } else if (compressorHeating && !fanRunning) {
-      // Heating without fan = hydronic/radiant (no filter usage)
+    } else if (primaryHeating && !fanRunning) {
+      // Primary heating without fan = hydronic/radiant (no filter usage)
       standardizedState = "Heating";
       isHeating = true;
       lastMode = "heating";
@@ -84,11 +96,12 @@ export function parseEquipStatus(equipmentStatus) {
     }
     // else: Fan_off (idle)
 
-    const isRunning = isCooling || isHeating || isFanOnly;
+    const isRunning = isCooling || isHeating || isAuxHeat || isFanOnly;
 
     return { 
       isCooling, 
-      isHeating, 
+      isHeating,
+      isAuxHeat,
       isFanOnly, 
       isRunning, 
       lastMode,
@@ -99,7 +112,8 @@ export function parseEquipStatus(equipmentStatus) {
     console.warn('Failed to parse equipment status:', err.message, 'input:', equipmentStatus);
     return { 
       isCooling: false, 
-      isHeating: false, 
+      isHeating: false,
+      isAuxHeat: false,
       isFanOnly: false, 
       isRunning: false, 
       lastMode: null,
@@ -111,6 +125,7 @@ export function parseEquipStatus(equipmentStatus) {
 
 export function modeFromParsed(parsed) {
   if (parsed.isCooling) return "cooling";
+  if (parsed.isAuxHeat) return "auxheat";
   if (parsed.isHeating) return "heating";
   if (parsed.isFanOnly) return "fanonly";
   return null;
