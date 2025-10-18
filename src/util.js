@@ -18,7 +18,18 @@ export function isExpiringSoon(expiresAtISO, thresholdSec = 120) {
 
 /**
  * Parse equipment status and map to standardized state classifications
- * Returns standardized states: Cooling_on, Cooling_Fan, Heating_on, Heating_Fan, Fan_only, Fan_off
+ * Uses fan presence in equipment status to determine filter usage states
+ * 
+ * @param {string} equipmentStatus - Raw Ecobee equipment status (e.g., "compCool1,fan", "auxHeat1", "fan")
+ * @returns {object} Parsed state with standardizedState for filter health tracking
+ * 
+ * State Logic:
+ * - Heating_Fan = heating equipment + fan (filter usage)
+ * - Heating = heating equipment only (no filter usage)
+ * - Cooling_Fan = cooling equipment + fan (filter usage)
+ * - Cooling = cooling equipment only (no filter usage - rare)
+ * - Fan_only = just fan (filter usage)
+ * - Fan_off = system idle (no filter usage)
  */
 export function parseEquipStatus(equipmentStatus) {
   try {
@@ -35,32 +46,43 @@ export function parseEquipStatus(equipmentStatus) {
                                has("heatpump") || has("heatpump1") || has("heatpump2") ||
                                has("heating");
     
-    // Detect fan
+    // Detect fan presence in equipment status
     const fanRunning = has("fan") || has("fanonly") || has("fanonly1");
 
-    // Determine standardized state
+    // Determine standardized state based on equipment + fan presence
     let standardizedState = "Fan_off";
     let isCooling = false;
     let isHeating = false;
     let isFanOnly = false;
     let lastMode = null;
 
-    if (compressorCooling) {
-      standardizedState = "Cooling_on";
+    if (compressorCooling && fanRunning) {
+      // Cooling with fan = filter usage
+      standardizedState = "Cooling_Fan";
       isCooling = true;
       lastMode = "cooling";
-    } else if (compressorHeating) {
-      standardizedState = "Heating_on";
+    } else if (compressorCooling && !fanRunning) {
+      // Cooling without fan = rare, but possible (e.g., water-cooled chiller)
+      standardizedState = "Cooling";
+      isCooling = true;
+      lastMode = "cooling";
+    } else if (compressorHeating && fanRunning) {
+      // Heating with fan = filter usage
+      standardizedState = "Heating_Fan";
+      isHeating = true;
+      lastMode = "heating";
+    } else if (compressorHeating && !fanRunning) {
+      // Heating without fan = hydronic/radiant (no filter usage)
+      standardizedState = "Heating";
       isHeating = true;
       lastMode = "heating";
     } else if (fanRunning) {
-      // Fan running without heating/cooling compressor
-      // Check if we're in a heating or cooling mode (fan circulation between cycles)
-      // For now, classify as Fan_only since we don't have mode context here
+      // Just fan = filter usage
       standardizedState = "Fan_only";
       isFanOnly = true;
       lastMode = "fanonly";
     }
+    // else: Fan_off (idle)
 
     const isRunning = isCooling || isHeating || isFanOnly;
 
