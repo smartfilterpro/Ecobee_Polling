@@ -4,7 +4,6 @@ import { isExpiringSoon, parseEquipStatus, nowUtc, sha } from './util.js';
 import {
   loadAllTokens,
   updateTokensAfterRefresh,
-  markSeenAndGetTransition,
   getLastRevision,
   setLastRevision,
   getRuntime,
@@ -25,7 +24,6 @@ import {
   parseConnectedFromRevision
 } from './normalize.js';
 import { handleRuntimeAndMaybePost } from './runtime.js';
-import { postToBubble, postConnectivityChange } from './bubble.js';
 import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
 import { v4 as uuidv4 } from 'uuid';
 import { ERROR_BACKOFF_MS, POLL_CONCURRENCY } from './config.js';
@@ -129,30 +127,18 @@ async function processThermostat(row) {
 
       if (isReachable) {
         console.log(`[${hvac_id}] 🟢 Thermostat reconnected to Ecobee`);
-        await postConnectivityChange({
-          userId: user_id,
-          hvac_id,
-          isReachable: true,
-          reason: 'thermostat_reconnected'
-        });
       } else {
         console.log(`[${hvac_id}] 🔴 Thermostat disconnected from Ecobee`);
-        await postConnectivityChange({
-          userId: user_id,
-          hvac_id,
-          isReachable: false,
-          reason: 'thermostat_disconnected'
-        });
       }
 
-      // ✅ Delegate posting to Core to runtime.js
+      // Connectivity posting is handled by runtime.js
       console.log(`[${hvac_id}] 🧠 Delegating connectivity post to runtime.js`);
     }
 
     /* ----------------------------- Log Summary ----------------------------- */
     const parsed = parseEquipStatus(equipStatus);
     console.log(
-      `[${hvac_id}] 📥 summary equip="${equipStatus}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning} ecobee_connected=${isConnectedToEcobee} reachable=${isReachable}`
+      `[${hvac_id}] 📥 summary equip="${equipStatus}" → "${parsed.standardizedState}" rev="${currentRev}" (prev="${prevRev}") running=${parsed.isRunning} ecobee_connected=${isConnectedToEcobee} reachable=${isReachable}`
     );
 
     const revisionChanged = !!currentRev && currentRev !== prevRev;
@@ -168,7 +154,7 @@ async function processThermostat(row) {
 
       const normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details);
 
-      // Handle runtime and post to Core/Bubble if session ends
+      // Handle runtime and post to Core if session ends
       const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
 
       // Dedupe by hash + significance check
@@ -192,21 +178,22 @@ async function processThermostat(row) {
           deviceKey: hvac_id,
           userId: user_id,
           deviceName: normalized.thermostatName,
+          firmwareVersion: normalized.firmwareVersion,
+          serialNumber: normalized.serialNumber,
           eventType: 'STATE_UPDATE',
-          equipmentStatus: parsed.isCooling
-            ? 'COOLING'
-            : parsed.isHeating
-            ? 'HEATING'
-            : parsed.isFanOnly
-            ? 'FAN'
-            : 'OFF',
+          equipmentStatus: parsed.standardizedState || 'Fan_off',
           previousStatus: lastStateData?.equipmentStatus || 'UNKNOWN',
           isActive: !!parsed.isRunning,
           mode: normalized.hvacMode,
           runtimeSeconds: null,
           temperatureF: normalized.actualTemperatureF,
+          humidity: normalized.humidity,
           heatSetpoint: normalized.desiredHeatF,
           coolSetpoint: normalized.desiredCoolF,
+          thermostatMode: normalized.hvacMode,
+          outdoorTemperatureF: normalized.outdoorTemperatureF,
+          outdoorHumidity: normalized.outdoorHumidity,
+          pressureHpa: normalized.pressureHpa,
           observedAt: new Date(),
           sourceEventId: uuidv4(),
           payloadRaw: normalized
@@ -219,16 +206,8 @@ async function processThermostat(row) {
         }
       }
 
-      // Post to Bubble for state change if hash changed
-      if (hasHashChanged && !runtimeResult.postedSessionEnd) {
-        try {
-          await postToBubble({ ...normalized, runtimeSeconds: null }, 'state-change');
-          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
-        } catch (e) {
-          console.error(`[${hvac_id}] ✗ Failed to post state change to Bubble:`, e.message);
-          throw e;
-        }
-      } else if (runtimeResult.postedSessionEnd) {
+      // Update last state if hash changed or session ended
+      if (hasHashChanged || runtimeResult.postedSessionEnd) {
         await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
       }
 
@@ -247,6 +226,10 @@ async function processThermostat(row) {
         actualTemperatureF: null,
         desiredHeatF: null,
         desiredCoolF: null,
+        humidity: null,
+        outdoorTemperatureF: null,
+        outdoorHumidity: null,
+        pressureHpa: null,
         ok: true,
         ts: nowUtc(),
         isReachable
