@@ -17,8 +17,8 @@ export function isExpiringSoon(expiresAtISO, thresholdSec = 120) {
 }
 
 /**
- * Parse equipment status with error handling
- * Handles compCool/compHeat/auxHeat/heatPump variations
+ * Parse equipment status and map to standardized state classifications
+ * Returns standardized states: Cooling_on, Cooling_Fan, Heating_on, Heating_Fan, Fan_only, Fan_off
  */
 export function parseEquipStatus(equipmentStatus) {
   try {
@@ -26,26 +26,51 @@ export function parseEquipStatus(equipmentStatus) {
     const tokens = raw.split(",").map(s => s.trim()).filter(Boolean);
     const has = (t) => tokens.includes(t);
 
-    const isCooling = has("cooling") || has("compcool1") || has("compcool2");
-    const isHeating = has("heating") || has("compheat1") || has("compheat2") ||
-                      has("auxheat1") || has("auxheat2") || has("auxheat3") ||
-                      has("heatpump") || has("heatpump1") || has("heatpump2");
-
+    // Detect cooling compressor
+    const compressorCooling = has("compcool1") || has("compcool2") || has("cooling");
+    
+    // Detect heating equipment (compressor, heat pump, or auxiliary heat)
+    const compressorHeating = has("compheat1") || has("compheat2") || 
+                               has("auxheat1") || has("auxheat2") || has("auxheat3") ||
+                               has("heatpump") || has("heatpump1") || has("heatpump2") ||
+                               has("heating");
+    
+    // Detect fan
     const fanRunning = has("fan") || has("fanonly") || has("fanonly1");
-    const isFanOnly = fanRunning && !isCooling && !isHeating;
-    const isRunning = isCooling || isHeating || isFanOnly;
 
+    // Determine standardized state
+    let standardizedState = "Fan_off";
+    let isCooling = false;
+    let isHeating = false;
+    let isFanOnly = false;
     let lastMode = null;
-    if (isCooling) lastMode = "cooling";
-    else if (isHeating) lastMode = "heating";
-    else if (isFanOnly) lastMode = "fanonly";
+
+    if (compressorCooling) {
+      standardizedState = "Cooling_on";
+      isCooling = true;
+      lastMode = "cooling";
+    } else if (compressorHeating) {
+      standardizedState = "Heating_on";
+      isHeating = true;
+      lastMode = "heating";
+    } else if (fanRunning) {
+      // Fan running without heating/cooling compressor
+      // Check if we're in a heating or cooling mode (fan circulation between cycles)
+      // For now, classify as Fan_only since we don't have mode context here
+      standardizedState = "Fan_only";
+      isFanOnly = true;
+      lastMode = "fanonly";
+    }
+
+    const isRunning = isCooling || isHeating || isFanOnly;
 
     return { 
       isCooling, 
       isHeating, 
       isFanOnly, 
       isRunning, 
-      lastMode, 
+      lastMode,
+      standardizedState,
       raw: equipmentStatus || "" 
     };
   } catch (err) {
@@ -55,7 +80,8 @@ export function parseEquipStatus(equipmentStatus) {
       isHeating: false, 
       isFanOnly: false, 
       isRunning: false, 
-      lastMode: null, 
+      lastMode: null,
+      standardizedState: "Fan_off",
       raw: String(equipmentStatus || "") 
     };
   }
