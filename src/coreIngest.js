@@ -7,17 +7,17 @@ import {
 } from "./config.js";
 import { nowUtc, sleep } from "./util.js";
 
-// ✅ new optional import
 const CORE_API_KEY = process.env.CORE_API_KEY;
 
 /**
- * Build Core Ingest payload matching Nest pattern
+ * Build Core Ingest payload matching standardized pattern
  */
 export function buildCorePayload({
   deviceKey,
   userId,
   deviceName,
-  // Ecobee-specific metadata
+  
+  // Device metadata
   manufacturer = "Ecobee",
   model = "Ecobee Thermostat",
   connectionSource = "ecobee",
@@ -38,11 +38,17 @@ export function buildCorePayload({
   mode,
   runtimeSeconds,
 
-  // Telemetry
+  // Telemetry - indoor
   temperatureF,
   humidity = null,
   heatSetpoint,
   coolSetpoint,
+  thermostatMode = null,
+
+  // Telemetry - outdoor (sticky)
+  outdoorTemperatureF = null,
+  outdoorHumidity = null,
+  pressureHpa = null,
 
   // Metadata
   observedAt,
@@ -79,12 +85,14 @@ export function buildCorePayload({
     zip_code_prefix: zipPrefix,
 
     last_mode: mode || null,
-    last_is_cooling: equipmentStatus === "COOLING",
-    last_is_heating: equipmentStatus === "HEATING",
-    last_is_fan_only: equipmentStatus === "FAN",
+    last_is_cooling: equipmentStatus === "Cooling_on" || equipmentStatus === "Cooling_Fan",
+    last_is_heating: equipmentStatus === "Heating_on" || equipmentStatus === "Heating_Fan" || 
+                     equipmentStatus === "AuxHeat" || equipmentStatus === "AuxHeat_Fan",
+    last_is_fan_only: equipmentStatus === "Fan_only",
     last_equipment_status: equipmentStatus || null,
     is_reachable: isReachable,
 
+    // Indoor telemetry
     last_temperature: temperatureF ?? null,
     temperature_f: temperatureF ?? null,
     temperature_c: temperatureC,
@@ -94,10 +102,17 @@ export function buildCorePayload({
     heat_setpoint_f: heatSetpoint ?? null,
     last_cool_setpoint: coolSetpoint ?? null,
     cool_setpoint_f: coolSetpoint ?? null,
+    thermostat_mode: thermostatMode,
 
+    // Outdoor telemetry (always include, sticky)
+    outdoor_temperature_f: outdoorTemperatureF,
+    outdoor_humidity: outdoorHumidity,
+    pressure_hpa: pressureHpa,
+
+    // Event data
     event_type: eventType,
     is_active: !!isActive,
-    equipment_status: equipmentStatus || "OFF",
+    equipment_status: equipmentStatus || "Fan_off",
     previous_status: previousStatus || "UNKNOWN",
     runtime_seconds: typeof runtimeSeconds === "number" ? runtimeSeconds : null,
     timestamp: isoNow,
@@ -110,7 +125,7 @@ export function buildCorePayload({
 }
 
 /**
- * Securely post to Core Ingest with retries
+ * Post to Core Ingest with JWT auth and retries
  */
 export async function postToCoreIngestAsync(payload, label = "event") {
   if (!CORE_INGEST_URL) {
@@ -128,7 +143,7 @@ export async function postToCoreIngestAsync(payload, label = "event") {
     ...(CORE_API_KEY ? { Authorization: `Bearer ${CORE_API_KEY}` } : {})
   };
 
-  // Core expects an array of events
+  // Core expects a flat array of events
   const body = Array.isArray(payload) ? payload : [payload];
   let lastError;
 
