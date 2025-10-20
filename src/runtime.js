@@ -11,13 +11,14 @@ const MS_TO_SECONDS = 1000;
 
 /**
  * Tracks runtime sessions, reachability, and state updates.
- * Posts ONLY to Core Ingest using standardized state classifications.
+ * Posts to Core Ingest using standardized 8-state classifications.
+ * Uses Mode_Change for state transitions, Telemetry_Update for environmental changes.
  */
 export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
   const nowIso = nowUtc();
   const parsed = parseEquipStatus(normalized.equipmentStatus);
   const currentMode = modeFromParsed(parsed);
-  const standardizedState = parsed.standardizedState || "Fan_off";
+  const standardizedState = parsed.standardizedState || "Idle";  // ✅ Changed from "Fan_off"
 
   let rt = await getRuntime(hvac_id);
   if (!rt) {
@@ -68,10 +69,11 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
         deviceName: normalized.thermostatName,
         firmwareVersion: normalized.firmwareVersion,
         serialNumber: normalized.serialNumber,
-        eventType: 'OFFLINE_SESSION_END',
-        equipmentStatus: 'Fan_off',
+        eventType: 'Mode_Change',           // ✅ State transition
+        equipmentStatus: 'Idle',            // ✅ Changed from 'Fan_off'
         previousStatus: lastEquipmentStatus,
         isActive: false,
+        isReachable: false,
         mode: 'off',
         runtimeSeconds: finalTotal,
         temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
@@ -105,10 +107,11 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       deviceName: normalized.thermostatName || backfill?.device_name || null,
       firmwareVersion: normalized.firmwareVersion || backfill?.firmware_version || null,
       serialNumber: normalized.serialNumber || backfill?.serial_number || null,
-      eventType: 'CONNECTIVITY_CHANGE',
-      equipmentStatus: 'Fan_off',
+      eventType: 'Connectivity_Change',    // ✅ Connectivity event
+      equipmentStatus: 'Idle',             // ✅ Changed from 'Fan_off'
       previousStatus: 'ONLINE',
       isActive: false,
+      isReachable: false,
       mode: 'off',
       runtimeSeconds: null,
       temperatureF: backfill?.last_temperature ?? null,
@@ -143,10 +146,11 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       deviceName: normalized.thermostatName || backfill?.device_name || null,
       firmwareVersion: normalized.firmwareVersion || backfill?.firmware_version || null,
       serialNumber: normalized.serialNumber || backfill?.serial_number || null,
-      eventType: 'CONNECTIVITY_CHANGE',
+      eventType: 'Connectivity_Change',    // ✅ Connectivity event
       equipmentStatus: standardizedState,
       previousStatus: 'OFFLINE',
       isActive: true,
+      isReachable: true,
       mode: currentMode || 'off',
       runtimeSeconds: null,
       temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
@@ -189,12 +193,13 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       deviceName: normalized.thermostatName,
       firmwareVersion: normalized.firmwareVersion,
       serialNumber: normalized.serialNumber,
-      eventType: `${currentMode?.toUpperCase() || 'UNKNOWN'}_START`,
+      eventType: 'Mode_Change',           // ✅ State transition
       equipmentStatus: standardizedState,
-      previousStatus: 'Fan_off',
+      previousStatus: 'Idle',             // ✅ Changed from 'Fan_off'
       isActive: true,
+      isReachable: true,
       mode: currentMode,
-      runtimeSeconds: null,
+      runtimeSeconds: undefined,          // ✅ START = undefined
       temperatureF: normalized.actualTemperatureF,
       humidity: normalized.humidity,
       heatSetpoint: normalized.desiredHeatF,
@@ -223,14 +228,60 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
     );
     const newTotal = (rt.current_session_seconds || 0) + deltaSec;
 
-    await setRuntime(hvac_id, {
-      current_session_seconds: newTotal,
-      last_tick_at: nowIso,
-      last_running_mode: currentMode || rt.last_running_mode,
-      last_equipment_status: standardizedState || rt.last_equipment_status,
-    });
+    // Check if equipment mode changed (e.g., Heating → Cooling)
+    const equipmentModeChanged = standardizedState !== rt.last_equipment_status;
 
-    console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s) mode=${currentMode || 'n/a'} status="${standardizedState}"`);
+    if (equipmentModeChanged) {
+      // MODE SWITCH - End old session, start new one
+      const corePayload = buildCorePayload({
+        deviceKey: hvac_id,
+        userId: user_id,
+        deviceName: normalized.thermostatName,
+        firmwareVersion: normalized.firmwareVersion,
+        serialNumber: normalized.serialNumber,
+        eventType: 'Mode_Change',           // ✅ State transition
+        equipmentStatus: standardizedState,
+        previousStatus: rt.last_equipment_status,
+        isActive: true,
+        isReachable: true,
+        mode: currentMode,
+        runtimeSeconds: newTotal,           // ✅ Runtime in previous mode
+        temperatureF: normalized.actualTemperatureF,
+        humidity: normalized.humidity,
+        heatSetpoint: normalized.desiredHeatF,
+        coolSetpoint: normalized.desiredCoolF,
+        thermostatMode: normalized.hvacMode,
+        outdoorTemperatureF: normalized.outdoorTemperatureF ?? backfill?.outdoor_temperature_f ?? null,
+        outdoorHumidity: normalized.outdoorHumidity ?? backfill?.outdoor_humidity ?? null,
+        pressureHpa: normalized.pressureHpa ?? backfill?.pressure_hpa ?? null,
+        observedAt: new Date(nowIso),
+        sourceEventId: uuidv4(),
+        payloadRaw: normalized,
+      });
+
+      console.log(`[${hvac_id}] 🔄 MODE SWITCH: ${rt.last_equipment_status} → ${standardizedState} (runtime=${newTotal}s)`);
+      await postToCoreIngestAsync(corePayload, 'mode-switch');
+
+      // Reset session for new mode
+      await setRuntime(hvac_id, {
+        current_session_seconds: 0,
+        current_session_started_at: nowIso,
+        last_tick_at: nowIso,
+        last_running_mode: currentMode || rt.last_running_mode,
+        last_equipment_status: standardizedState,
+      });
+    } else {
+      // Just update tick counter
+      await setRuntime(hvac_id, {
+        current_session_seconds: newTotal,
+        last_tick_at: nowIso,
+        last_running_mode: currentMode || rt.last_running_mode,
+        last_equipment_status: standardizedState || rt.last_equipment_status,
+      });
+
+      console.log(`[${hvac_id}] ⏱️ tick +${deltaSec}s (total=${newTotal}s) mode=${currentMode || 'n/a'} status="${standardizedState}"`);
+    }
+
     return { postedSessionEnd: false };
   }
 
@@ -254,10 +305,11 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       deviceName: normalized.thermostatName,
       firmwareVersion: normalized.firmwareVersion,
       serialNumber: normalized.serialNumber,
-      eventType: 'STATUS_CHANGE',
-      equipmentStatus: 'Fan_off',
+      eventType: 'Mode_Change',           // ✅ State transition
+      equipmentStatus: 'Idle',            // ✅ Changed from 'Fan_off'
       previousStatus: lastEquipmentStatus,
       isActive: false,
+      isReachable: true,
       mode: 'off',
       runtimeSeconds: finalTotal,
       temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature ?? null,
@@ -303,10 +355,11 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
         deviceName: normalized.thermostatName,
         firmwareVersion: normalized.firmwareVersion,
         serialNumber: normalized.serialNumber,
-        eventType: 'STATE_UPDATE',
-        equipmentStatus: 'Fan_off',
-        previousStatus: 'Fan_off',
+        eventType: 'Telemetry_Update',     // ✅ Environmental update
+        equipmentStatus: 'Idle',           // ✅ Changed from 'Fan_off'
+        previousStatus: 'Idle',            // ✅ Changed from 'Fan_off'
         isActive: false,
+        isReachable: true,
         mode: 'off',
         runtimeSeconds: null,
         temperatureF: normalized.actualTemperatureF ?? null,
@@ -323,10 +376,10 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       });
 
       console.log(
-        `[${hvac_id}] 🌡️ STATE_UPDATE (idle) temp=${normalized.actualTemperatureF}F humidity=${normalized.humidity ?? '—'}`
+        `[${hvac_id}] 🌡️ TELEMETRY_UPDATE (idle) temp=${normalized.actualTemperatureF}F humidity=${normalized.humidity ?? '—'}`
       );
 
-      await postToCoreIngestAsync(corePayload, 'state-update');
+      await postToCoreIngestAsync(corePayload, 'telemetry-update');
     }
   }
 
