@@ -17,8 +17,8 @@ const MS_TO_SECONDS = 1000;
  *   "" → Idle
  *   "heat" → Heating
  *   "heat,fan" → Heating_Fan
- *   "cool,fan" → Cooling_Fan
- *   "auxHeat,fan" → AuxHeat_Fan
+ *   "compCool1,fan" → Cooling_Fan
+ *   "auxHeat1,fan" → AuxHeat_Fan
  *   "fan" → Fan_only
  */
 function parseEcobeeEquipmentStatus(equipmentStatus) {
@@ -36,13 +36,21 @@ function parseEcobeeEquipmentStatus(equipmentStatus) {
   const parts = status.split(',').map(s => s.trim());
   const hasFan = parts.includes('fan');
   
-  // Check for heating modes
-  const hasHeat = parts.some(p => p === 'heat' || p === 'heat2');
-  const hasHeatPump = parts.some(p => p === 'heatpump' || p === 'heatpump2');
-  const hasAuxHeat = parts.includes('auxheat');
+  // Check for heating modes (heat, heat2, heat3, heatPump, heatPump2, heatPump3)
+  const hasHeat = parts.some(p => 
+    p === 'heat' || p.startsWith('heat') || 
+    p === 'heatpump' || p.startsWith('heatpump')
+  );
   
-  // Check for cooling modes
-  const hasCool = parts.some(p => p === 'cool' || p === 'cool2');
+  // Check for auxiliary heat (auxHeat1, auxHeat2, auxHeat3, auxHeat, emergency)
+  const hasAuxHeat = parts.some(p => 
+    p.startsWith('auxheat') || p === 'auxheat' || p === 'emergency'
+  );
+  
+  // Check for cooling modes (cool, cool2, compCool1, compCool2, etc.)
+  const hasCool = parts.some(p => 
+    p === 'cool' || p.startsWith('cool') || p.startsWith('compcool')
+  );
   
   // Auxiliary heat (emergency/backup heat)
   if (hasAuxHeat) {
@@ -54,7 +62,7 @@ function parseEcobeeEquipmentStatus(equipmentStatus) {
   }
   
   // Heating (furnace or heat pump)
-  if (hasHeat || hasHeatPump) {
+  if (hasHeat) {
     if (hasFan) {
       return { eventType: 'Heating_Fan', equipmentStatus: 'HEATING', isActive: true, mode: 'heating' };
     } else {
