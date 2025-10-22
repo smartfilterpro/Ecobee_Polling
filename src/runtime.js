@@ -68,6 +68,13 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
   const runtimeRev = normalized.runtimeRev || null;
   const backfill = await getBackfillState(hvac_id);
 
+  // merge new + backfill telemetry
+  const temperatureF = normalized.actualTemperatureF ?? backfill?.last_temperature ?? null;
+  const humidity = normalized.humidity ?? backfill?.last_humidity ?? null;
+  const heatSetpoint = normalized.desiredHeatF ?? backfill?.last_heat_setpoint ?? null;
+  const coolSetpoint = normalized.desiredCoolF ?? backfill?.last_cool_setpoint ?? null;
+  const thermostatMode = normalized.hvacMode ?? backfill?.thermostat_mode ?? null;
+
   let rt = await getRuntime(hvac_id);
   if (!rt) {
     await setRuntime(hvac_id, {
@@ -80,6 +87,8 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
     });
     rt = await getRuntime(hvac_id);
   }
+
+  const prevEquipStatus = rt.last_equipment_status || backfill?.last_equipment_status || 'IDLE';
 
   /* -------------------------- Skip identical runtime -------------------------- */
   if (runtimeRev && rt.last_runtime_rev === runtimeRev) {
@@ -96,27 +105,31 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
   });
 
   const wasActive = rt.is_running;
-  const prevEventType = rt.last_event_type || 'Idle';
   const lastTickMs = rt.last_tick_at ? toMillis(rt.last_tick_at) : nowMs;
   const deltaSec = Math.min(Math.max(0, (nowMs - lastTickMs) / MS_TO_SECONDS), MAX_ACCUMULATE_SECONDS);
 
   /* --------------------------- Connectivity handling --------------------------- */
   if (!isReachable) {
     if (rt.is_reachable === false) {
-      const nextPollSeconds = 600;
-      return { skipped: true, nextPollSeconds };
+      return { skipped: true, nextPollSeconds: 600 };
     }
 
     if (wasActive) {
-      const total = (rt.current_session_seconds || 0) + deltaSec;
+      const total = Math.round((rt.current_session_seconds || 0) + deltaSec);
       const payload = buildCorePayload({
         deviceKey: hvac_id,
         userId: user_id,
         eventType: 'Mode_Change',
         equipmentStatus: 'IDLE',
+        previousStatus: prevEquipStatus,
         isActive: false,
         isReachable: false,
         runtimeSeconds: total,
+        temperatureF,
+        humidity,
+        heatSetpoint,
+        coolSetpoint,
+        thermostatMode,
         observedAt: new Date(nowIso),
       });
       await postToCoreIngestAsync(payload, 'offline-session-end');
@@ -128,13 +141,13 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
       userId: user_id,
       eventType: 'Connectivity_Change',
       equipmentStatus: 'IDLE',
+      previousStatus: prevEquipStatus,
       isActive: false,
       isReachable: false,
       observedAt: new Date(nowIso),
     });
     await postToCoreIngestAsync(payload, 'connectivity-offline');
     await setRuntime(hvac_id, { is_reachable: false });
-
     return { postedSessionEnd: true, nextPollSeconds: 600 };
   }
 
@@ -144,6 +157,7 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
       userId: user_id,
       eventType: 'Connectivity_Change',
       equipmentStatus,
+      previousStatus: prevEquipStatus,
       isActive,
       isReachable: true,
       observedAt: new Date(nowIso),
@@ -161,13 +175,26 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
       last_tick_at: nowIso,
       current_session_seconds: 0,
       last_event_type: eventType,
+      last_equipment_status: eventType,
+      last_temperature: temperatureF,
+      last_humidity: humidity,
+      last_heat_setpoint: heatSetpoint,
+      last_cool_setpoint: coolSetpoint,
+      thermostat_mode: thermostatMode,
     });
+
     const payload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
       eventType: 'Mode_Change',
       equipmentStatus: eventType,
+      previousStatus: prevEquipStatus,
       isActive: true,
+      temperatureF,
+      humidity,
+      heatSetpoint,
+      coolSetpoint,
+      thermostatMode,
       observedAt: new Date(nowIso),
       sourceEventId: id,
     });
@@ -177,10 +204,19 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
 
   /* ----------------------------- Session tick ------------------------------ */
   if (wasActive && isActive) {
-    const total = (rt.current_session_seconds || 0) + deltaSec;
+    const total = Math.round((rt.current_session_seconds || 0) + deltaSec);
     const shouldWrite = (nowMs - lastTickMs) / 1000 >= MIN_WRITE_INTERVAL_SECONDS;
     if (shouldWrite) {
-      await setRuntime(hvac_id, { current_session_seconds: total, last_tick_at: nowIso });
+      await setRuntime(hvac_id, {
+        current_session_seconds: total,
+        last_tick_at: nowIso,
+        last_temperature: temperatureF,
+        last_humidity: humidity,
+        last_heat_setpoint: heatSetpoint,
+        last_cool_setpoint: coolSetpoint,
+        thermostat_mode: thermostatMode,
+        last_equipment_status: eventType,
+      });
     }
     const nextPollSeconds = calculateNextPollSeconds(rt, parsed, rt.last_runtime_rev_changed_at);
     console.log(`[${hvac_id}] Active ${eventType} tick +${deltaSec}s (total=${total}s) → next poll ${nextPollSeconds}s`);
@@ -189,17 +225,31 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
 
   /* ----------------------------- Session end ------------------------------- */
   if (wasActive && !isActive) {
-    const total = (rt.current_session_seconds || 0) + deltaSec;
+    const total = Math.round((rt.current_session_seconds || 0) + deltaSec);
     const payload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
       eventType: 'Mode_Change',
       equipmentStatus: 'IDLE',
+      previousStatus: prevEquipStatus,
       isActive: false,
       runtimeSeconds: total,
+      temperatureF,
+      humidity,
+      heatSetpoint,
+      coolSetpoint,
+      thermostatMode,
       observedAt: new Date(nowIso),
     });
     await postToCoreIngestAsync(payload, 'session-end');
+    await setRuntime(hvac_id, {
+      last_equipment_status: 'IDLE',
+      last_temperature: temperatureF,
+      last_humidity: humidity,
+      last_heat_setpoint: heatSetpoint,
+      last_cool_setpoint: coolSetpoint,
+      thermostat_mode: thermostatMode,
+    });
     await resetRuntime(hvac_id);
     return { postedSessionEnd: true, nextPollSeconds: 360 };
   }
@@ -207,6 +257,14 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
   /* ----------------------------- Idle updates ------------------------------ */
   if (!wasActive && !isActive) {
     const nextPollSeconds = 360;
+    await setRuntime(hvac_id, {
+      last_temperature: temperatureF,
+      last_humidity: humidity,
+      last_heat_setpoint: heatSetpoint,
+      last_cool_setpoint: coolSetpoint,
+      thermostat_mode: thermostatMode,
+      last_equipment_status: 'IDLE',
+    });
     return { skipped: true, nextPollSeconds };
   }
 
