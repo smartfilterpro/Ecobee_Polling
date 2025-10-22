@@ -23,7 +23,7 @@ import {
   normalizeFromDetails,
   parseConnectedFromRevision
 } from './normalize.js';
-import { handleRuntimeAndMaybePost } from './runtime.js';
+import { handleRuntimeAndMaybePostAdaptive as handleRuntimeAndMaybePost } from './runtime.js';
 import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
 import { v4 as uuidv4 } from 'uuid';
 import { ERROR_BACKOFF_MS, POLL_CONCURRENCY } from './config.js';
