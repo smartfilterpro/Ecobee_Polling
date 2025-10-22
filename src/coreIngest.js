@@ -112,7 +112,7 @@ export function buildCorePayload({
     // Event data
     event_type: eventType,
     is_active: !!isActive,
-    equipment_status: equipmentStatus || "Fan_off",
+    equipment_status: equipmentStatus || "Idle",
     previous_status: previousStatus || "UNKNOWN",
     runtime_seconds: typeof runtimeSeconds === "number" ? runtimeSeconds : null,
     timestamp: isoNow,
