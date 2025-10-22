@@ -111,6 +111,10 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       last_equipment_status: null,
       is_reachable: true,
       last_seen_at: nowIso,
+      last_posted_temp: null,
+      last_posted_humidity: null,
+      last_posted_heat_setpoint: null,
+      last_posted_cool_setpoint: null,
     });
     rt = await getRuntime(hvac_id);
   }
