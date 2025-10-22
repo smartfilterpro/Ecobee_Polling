@@ -274,8 +274,8 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       firmwareVersion: normalized.firmwareVersion,
       serialNumber: normalized.serialNumber,
       eventType: 'Mode_Change',
-      equipmentStatus: equipmentStatus,
-      previousStatus: prevEquipmentStatus,
+      equipmentStatus: eventType,  // ✅ Use full classification (e.g., "Cooling_Fan")
+      previousStatus: prevEventType,
       isActive: true,
       isReachable: true,
       mode: mode,
@@ -319,8 +319,8 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
         firmwareVersion: normalized.firmwareVersion,
         serialNumber: normalized.serialNumber,
         eventType: 'Mode_Change',
-        equipmentStatus: equipmentStatus,
-        previousStatus: prevEquipmentStatus,
+        equipmentStatus: eventType,  // ✅ Use full classification
+        previousStatus: prevEventType,
         isActive: true,
         isReachable: true,
         mode: mode,
