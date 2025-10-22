@@ -128,7 +128,7 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
   // Get backfill for sticky outdoor data
   const backfill = await getBackfillState(hvac_id);
 
-  console.log(`[${hvac_id}] Status: "${normalized.equipmentStatus}" → ${eventType} (prev: ${prevEventType}) active=${isActive} wasActive=${wasActive} modeChanged=${equipmentModeChanged}`);
+  console.log(`[${hvac_id}] Status: "${normalized.equipmentStatus}" → ${eventType} (prev: ${prevEventType}) active=${isActive} wasActive=${wasActive} modeChanged=${equipmentModeChanged} prevEquipStatus=${prevEquipmentStatus}`);
 
   /* -------------------------------------------------------------------------- */
   /*                      DEVICE UNREACHABLE (OFFLINE HANDLING)                 */
