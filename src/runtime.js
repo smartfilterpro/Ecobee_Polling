@@ -6,32 +6,30 @@ import { getRuntime, setRuntime, resetRuntime, getBackfillState } from './db.js'
 import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
 import { MAX_ACCUMULATE_SECONDS } from './config.js';
 
-const MIN_DELTA_SECONDS = 0;
 const MS_TO_SECONDS = 1000;
-const MIN_WRITE_INTERVAL_SECONDS = 60; // ✅ Don't write to DB more than once per minute
+const MIN_WRITE_INTERVAL_SECONDS = 60;
+const LONG_RUNTIME_THRESHOLD_SECONDS = 30 * 60; // 30 min continuous operation
 
-// Cache identical Ecobee status parses (since many thermostats report same strings)
 const statusCache = new Map();
 
 /* -------------------------------------------------------------------------- */
-/*                           Parse Equipment Status                           */
+/*                     Parse Ecobee equipmentStatus String                    */
 /* -------------------------------------------------------------------------- */
-function parseEcobeeEquipmentStatus(statusRaw) {
+function parseEcobeeEquipmentStatusCached(statusRaw) {
   if (statusCache.has(statusRaw)) return statusCache.get(statusRaw);
 
   const status = (statusRaw || '').toLowerCase().trim();
   let result;
 
-  if (!status) {
-    result = { eventType: 'Idle', equipmentStatus: 'IDLE', isActive: false, mode: 'off' };
-  } else {
+  if (!status) result = { eventType: 'Idle', equipmentStatus: 'IDLE', isActive: false, mode: 'off' };
+  else {
     const parts = status.split(',').map(s => s.trim());
     const hasFan = parts.includes('fan');
-    const hasHeat = parts.some(p => p === 'heat' || p.startsWith('heat') || p === 'heatpump' || p.startsWith('heatpump'));
-    const hasAuxHeat = parts.some(p => p.startsWith('auxheat') || p === 'auxheat' || p === 'emergency');
-    const hasCool = parts.some(p => p === 'cool' || p.startsWith('cool') || p.startsWith('compcool'));
+    const hasHeat = parts.some(p => p.startsWith('heat') || p.startsWith('heatpump'));
+    const hasAux = parts.some(p => p.startsWith('auxheat') || p === 'emergency');
+    const hasCool = parts.some(p => p.startsWith('cool') || p.startsWith('compcool'));
 
-    if (hasAuxHeat) result = { eventType: hasFan ? 'AuxHeat_Fan' : 'AuxHeat', equipmentStatus: 'AUX_HEATING', isActive: true, mode: 'auxheat' };
+    if (hasAux) result = { eventType: hasFan ? 'AuxHeat_Fan' : 'AuxHeat', equipmentStatus: 'AUX_HEATING', isActive: true, mode: 'auxheat' };
     else if (hasHeat) result = { eventType: hasFan ? 'Heating_Fan' : 'Heating', equipmentStatus: 'HEATING', isActive: true, mode: 'heating' };
     else if (hasCool) result = { eventType: hasFan ? 'Cooling_Fan' : 'Cooling', equipmentStatus: 'COOLING', isActive: true, mode: 'cooling' };
     else if (hasFan) result = { eventType: 'Fan_only', equipmentStatus: 'FAN', isActive: true, mode: 'fan' };
@@ -43,76 +41,83 @@ function parseEcobeeEquipmentStatus(statusRaw) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                       Optimized Runtime & Posting Logic                    */
+/*                   Calculate Next Poll Interval Dynamically                 */
 /* -------------------------------------------------------------------------- */
-export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized) {
+export function calculateNextPollSeconds(rt, parsed, lastRuntimeRevChangedAt) {
+  const now = Date.now();
+  const ageSec = lastRuntimeRevChangedAt ? (now - toMillis(lastRuntimeRevChangedAt)) / 1000 : 0;
+
+  if (!rt.is_reachable) return 600; // offline → 10 min
+  if (!parsed.isActive) return 360; // idle → 6 min
+  if (parsed.isActive && rt.current_session_seconds > LONG_RUNTIME_THRESHOLD_SECONDS) return 180; // long run
+  if (rt.pending_mode_change) return 60; // verifying transition
+  if (ageSec < 60) return 90; // fresh update, poll soon again
+
+  return 120; // default active → 2 min
+}
+
+/* -------------------------------------------------------------------------- */
+/*              Main runtime handler with adaptive polling hint               */
+/* -------------------------------------------------------------------------- */
+export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, normalized) {
   const nowIso = nowUtc();
   const nowMs = Date.now();
-  const parsed = parseEcobeeEquipmentStatus(normalized.equipmentStatus);
+  const parsed = parseEcobeeEquipmentStatusCached(normalized.equipmentStatus);
   const { eventType, equipmentStatus, isActive, mode } = parsed;
   const isReachable = normalized.isReachable !== false;
-  const runtimeRev = normalized.runtimeRev || null; // ✅ Ecobee runtime revision hint
+  const runtimeRev = normalized.runtimeRev || null;
   const backfill = await getBackfillState(hvac_id);
 
-  // Retrieve runtime state
   let rt = await getRuntime(hvac_id);
   if (!rt) {
     await setRuntime(hvac_id, {
       is_running: false,
-      current_session_started_at: null,
-      last_tick_at: null,
+      last_event_type: 'Idle',
       current_session_seconds: 0,
-      last_running_mode: null,
-      last_event_type: null,
-      last_equipment_status: null,
       is_reachable: true,
-      last_seen_at: nowIso,
       last_runtime_rev: null,
+      last_runtime_rev_changed_at: nowIso,
     });
     rt = await getRuntime(hvac_id);
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                  🔕 Skip Poll if Runtime Revision Unchanged                */
-  /* -------------------------------------------------------------------------- */
+  /* -------------------------- Skip identical runtime -------------------------- */
   if (runtimeRev && rt.last_runtime_rev === runtimeRev) {
-    console.log(`[${hvac_id}] No runtime change (rev=${runtimeRev}) — skipping poll`);
-    return { skipped: true };
+    const nextPollSeconds = calculateNextPollSeconds(rt, parsed, rt.last_runtime_rev_changed_at);
+    console.log(`[${hvac_id}] ⏳ No runtime change (rev=${runtimeRev}); next poll in ${nextPollSeconds}s`);
+    return { skipped: true, nextPollSeconds };
   }
 
-  // Update runtime revision
-  await setRuntime(hvac_id, { last_runtime_rev: runtimeRev, last_seen_at: nowIso });
+  // Update runtime revision + timestamp of change
+  await setRuntime(hvac_id, {
+    last_runtime_rev: runtimeRev,
+    last_runtime_rev_changed_at: nowIso,
+    last_seen_at: nowIso,
+  });
 
   const wasActive = rt.is_running;
   const prevEventType = rt.last_event_type || 'Idle';
-  const prevEquipStatus = rt.last_equipment_status || 'IDLE';
-  const modeChanged = wasActive && eventType !== prevEventType;
-  const lastWriteMs = rt.last_tick_at ? toMillis(rt.last_tick_at) : 0;
-  const shouldWrite = (nowMs - lastWriteMs) / 1000 >= MIN_WRITE_INTERVAL_SECONDS || modeChanged;
+  const lastTickMs = rt.last_tick_at ? toMillis(rt.last_tick_at) : nowMs;
+  const deltaSec = Math.min(Math.max(0, (nowMs - lastTickMs) / MS_TO_SECONDS), MAX_ACCUMULATE_SECONDS);
 
-  /* -------------------------------------------------------------------------- */
-  /*                        📴 Device Offline Handling                          */
-  /* -------------------------------------------------------------------------- */
+  /* --------------------------- Connectivity handling --------------------------- */
   if (!isReachable) {
-    if (rt.is_reachable === false) return { postedSessionEnd: false }; // Already offline
+    if (rt.is_reachable === false) {
+      const nextPollSeconds = 600;
+      return { skipped: true, nextPollSeconds };
+    }
 
     if (wasActive) {
-      const deltaSec = Math.min(Math.max(0, (nowMs - lastWriteMs) / MS_TO_SECONDS), MAX_ACCUMULATE_SECONDS);
       const total = (rt.current_session_seconds || 0) + deltaSec;
       const payload = buildCorePayload({
         deviceKey: hvac_id,
         userId: user_id,
-        deviceName: normalized.thermostatName,
         eventType: 'Mode_Change',
         equipmentStatus: 'IDLE',
-        previousStatus: prevEquipStatus,
         isActive: false,
         isReachable: false,
-        mode: 'off',
         runtimeSeconds: total,
-        temperatureF: normalized.actualTemperatureF ?? backfill?.last_temperature,
         observedAt: new Date(nowIso),
-        sourceEventId: uuidv4(),
       });
       await postToCoreIngestAsync(payload, 'offline-session-end');
       await resetRuntime(hvac_id);
@@ -121,169 +126,89 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
     const payload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
-      deviceName: normalized.thermostatName,
       eventType: 'Connectivity_Change',
       equipmentStatus: 'IDLE',
-      previousStatus: 'ONLINE',
       isActive: false,
       isReachable: false,
-      mode: 'off',
-      runtimeSeconds: null,
       observedAt: new Date(nowIso),
-      sourceEventId: uuidv4(),
     });
     await postToCoreIngestAsync(payload, 'connectivity-offline');
     await setRuntime(hvac_id, { is_reachable: false });
-    return { postedSessionEnd: true };
+
+    return { postedSessionEnd: true, nextPollSeconds: 600 };
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                         🟢 Device Reconnected                              */
-  /* -------------------------------------------------------------------------- */
   if (rt.is_reachable === false && isReachable) {
     const payload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
-      deviceName: normalized.thermostatName,
       eventType: 'Connectivity_Change',
       equipmentStatus,
-      previousStatus: 'OFFLINE',
       isActive,
       isReachable: true,
-      mode,
-      runtimeSeconds: null,
       observedAt: new Date(nowIso),
-      sourceEventId: uuidv4(),
     });
     await postToCoreIngestAsync(payload, 'connectivity-online');
     await setRuntime(hvac_id, { is_reachable: true });
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                             ▶️ SESSION START                              */
-  /* -------------------------------------------------------------------------- */
+  /* ----------------------------- Session start ----------------------------- */
   if (!wasActive && isActive) {
-    const sessionId = uuidv4();
+    const id = uuidv4();
     await setRuntime(hvac_id, {
       is_running: true,
       current_session_started_at: nowIso,
       last_tick_at: nowIso,
       current_session_seconds: 0,
-      last_running_mode: mode,
       last_event_type: eventType,
-      last_equipment_status: eventType,
     });
     const payload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
-      deviceName: normalized.thermostatName,
       eventType: 'Mode_Change',
       equipmentStatus: eventType,
-      previousStatus: prevEventType,
       isActive: true,
-      isReachable: true,
-      mode,
-      runtimeSeconds: undefined,
       observedAt: new Date(nowIso),
-      sourceEventId: sessionId,
+      sourceEventId: id,
     });
     await postToCoreIngestAsync(payload, 'session-start');
-    return { postedSessionEnd: false };
+    return { postedSessionEnd: false, nextPollSeconds: 90 };
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                          ⏱️ SESSION ACTIVE TICK                           */
-  /* -------------------------------------------------------------------------- */
+  /* ----------------------------- Session tick ------------------------------ */
   if (wasActive && isActive) {
-    const deltaSec = Math.min(Math.max(0, (nowMs - lastWriteMs) / MS_TO_SECONDS), MAX_ACCUMULATE_SECONDS);
-    const newTotal = (rt.current_session_seconds || 0) + deltaSec;
-
-    // Debounce minor mode flaps — require 1 poll cycle of stability before posting
-    if (modeChanged && rt.pending_mode_change === eventType) {
-      const payload = buildCorePayload({
-        deviceKey: hvac_id,
-        userId: user_id,
-        deviceName: normalized.thermostatName,
-        eventType: 'Mode_Change',
-        equipmentStatus: eventType,
-        previousStatus: prevEventType,
-        isActive: true,
-        isReachable: true,
-        mode,
-        runtimeSeconds: newTotal,
-        observedAt: new Date(nowIso),
-        sourceEventId: uuidv4(),
-      });
-      await postToCoreIngestAsync(payload, 'mode-switch');
-      await setRuntime(hvac_id, {
-        current_session_seconds: 0,
-        current_session_started_at: nowIso,
-        last_tick_at: nowIso,
-        last_running_mode: mode,
-        last_event_type: eventType,
-        last_equipment_status: equipmentStatus,
-        pending_mode_change: null,
-      });
-    } else if (modeChanged) {
-      await setRuntime(hvac_id, { pending_mode_change: eventType });
-    } else if (shouldWrite) {
-      await setRuntime(hvac_id, { current_session_seconds: newTotal, last_tick_at: nowIso });
+    const total = (rt.current_session_seconds || 0) + deltaSec;
+    const shouldWrite = (nowMs - lastTickMs) / 1000 >= MIN_WRITE_INTERVAL_SECONDS;
+    if (shouldWrite) {
+      await setRuntime(hvac_id, { current_session_seconds: total, last_tick_at: nowIso });
     }
-
-    return { postedSessionEnd: false };
+    const nextPollSeconds = calculateNextPollSeconds(rt, parsed, rt.last_runtime_rev_changed_at);
+    console.log(`[${hvac_id}] Active ${eventType} tick +${deltaSec}s (total=${total}s) → next poll ${nextPollSeconds}s`);
+    return { postedSessionEnd: false, nextPollSeconds };
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                             ⏹️ SESSION END                               */
-  /* -------------------------------------------------------------------------- */
+  /* ----------------------------- Session end ------------------------------- */
   if (wasActive && !isActive) {
-    const deltaSec = Math.min(Math.max(0, (nowMs - lastWriteMs) / MS_TO_SECONDS), MAX_ACCUMULATE_SECONDS);
     const total = (rt.current_session_seconds || 0) + deltaSec;
     const payload = buildCorePayload({
       deviceKey: hvac_id,
       userId: user_id,
-      deviceName: normalized.thermostatName,
       eventType: 'Mode_Change',
       equipmentStatus: 'IDLE',
-      previousStatus: prevEquipStatus,
       isActive: false,
-      isReachable: true,
-      mode: 'off',
       runtimeSeconds: total,
       observedAt: new Date(nowIso),
-      sourceEventId: uuidv4(),
     });
     await postToCoreIngestAsync(payload, 'session-end');
     await resetRuntime(hvac_id);
-    return { postedSessionEnd: true };
+    return { postedSessionEnd: true, nextPollSeconds: 360 };
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                         🌡️ Idle Telemetry Update                          */
-  /* -------------------------------------------------------------------------- */
-  if (!wasActive && !isActive && isReachable && shouldWrite && normalized.actualTemperatureF != null) {
-    const prevTemp = backfill?.last_temperature ?? null;
-    const tempChanged = prevTemp == null || Math.abs(normalized.actualTemperatureF - prevTemp) >= 0.5;
-    if (tempChanged) {
-      const payload = buildCorePayload({
-        deviceKey: hvac_id,
-        userId: user_id,
-        deviceName: normalized.thermostatName,
-        eventType: 'Telemetry_Update',
-        equipmentStatus: 'IDLE',
-        previousStatus: 'IDLE',
-        isActive: false,
-        isReachable: true,
-        mode: 'off',
-        runtimeSeconds: null,
-        temperatureF: normalized.actualTemperatureF,
-        humidity: normalized.humidity,
-        observedAt: new Date(nowIso),
-        sourceEventId: uuidv4(),
-      });
-      await postToCoreIngestAsync(payload, 'telemetry-update');
-    }
+  /* ----------------------------- Idle updates ------------------------------ */
+  if (!wasActive && !isActive) {
+    const nextPollSeconds = 360;
+    return { skipped: true, nextPollSeconds };
   }
 
-  return { postedSessionEnd: false };
+  return { nextPollSeconds: 180 };
 }
