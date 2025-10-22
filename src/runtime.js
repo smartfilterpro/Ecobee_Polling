@@ -264,8 +264,8 @@ export async function handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized
       last_tick_at: nowIso,
       current_session_seconds: 0,
       last_running_mode: mode,
-      last_event_type: eventType,
-      last_equipment_status: equipmentStatus,
+      last_event_type: eventType,           // ✅ Save full classification (e.g., "Cooling_Fan")
+      last_equipment_status: eventType,     // ✅ Save full classification (e.g., "Cooling_Fan")
       is_reachable: true,
     });
 
