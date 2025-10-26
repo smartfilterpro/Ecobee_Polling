@@ -9,6 +9,7 @@ import {
   getRuntime,
   setRuntime,
   getLastHash,
+  getLastPostedAt,
   setLastState,
   pool
 } from './db.js';
@@ -26,7 +27,7 @@ import {
 import { handleRuntimeAndMaybePostAdaptive as handleRuntimeAndMaybePost } from './runtime.js';
 import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
 import { v4 as uuidv4 } from 'uuid';
-import { ERROR_BACKOFF_MS, POLL_CONCURRENCY } from './config.js';
+import { ERROR_BACKOFF_MS, POLL_CONCURRENCY, MAX_TIME_BETWEEN_POSTS_MS } from './config.js';
 
 /* -------------------------------------------------------------------------- */
 /*                            TOKEN MANAGEMENT                                */
@@ -173,7 +174,16 @@ async function processThermostat(row) {
       const shouldPostStateChange = hasSignificantStateChange(lastStateData, normalized);
       const hasHashChanged = newHash !== lastHash;
 
-      if (shouldPostStateChange && hasHashChanged && !runtimeResult.postedSessionEnd) {
+      // Check if we should force a post due to time elapsed since last post
+      const lastPostedAt = await getLastPostedAt(hvac_id);
+      const timeSinceLastPost = lastPostedAt ? Date.now() - new Date(lastPostedAt).getTime() : Infinity;
+      const shouldForcePostDueToTime = timeSinceLastPost >= MAX_TIME_BETWEEN_POSTS_MS;
+
+      if (shouldForcePostDueToTime) {
+        console.log(`[${hvac_id}] ⏰ Forcing post: ${Math.round(timeSinceLastPost / 1000 / 60 / 60)}h since last post (threshold: ${MAX_TIME_BETWEEN_POSTS_MS / 1000 / 60 / 60}h)`);
+      }
+
+      if ((shouldPostStateChange && hasHashChanged && !runtimeResult.postedSessionEnd) || shouldForcePostDueToTime) {
         const corePayload = buildCorePayload({
           deviceKey: hvac_id,
           userId: user_id,
@@ -201,13 +211,16 @@ async function processThermostat(row) {
 
         try {
           await postToCoreIngestAsync(corePayload, 'state-update');
+          console.log(`[${hvac_id}] ✓ Posted state update to Core`);
+          // Update last_posted_at since we successfully posted
+          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null }, true);
         } catch (e) {
           console.error(`[${hvac_id}] ✗ Failed to post state update to Core:`, e.message);
         }
       }
 
-      // Update last state if hash changed or session ended
-      if (hasHashChanged || runtimeResult.postedSessionEnd) {
+      // Update last state if hash changed or session ended (but not already updated after post)
+      else if (hasHashChanged || runtimeResult.postedSessionEnd) {
         await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
       }
 
@@ -216,28 +229,84 @@ async function processThermostat(row) {
 
     /* ----------------------- Revision Unchanged → Tick ----------------------- */
     else {
-      const normalized = {
-        userId: user_id,
-        hvacId: hvac_id,
-        thermostatName: null,
-        hvacMode: null,
-        equipmentStatus: equipStatus,
-        ...parseEquipStatus(equipStatus),
-        actualTemperatureF: null,
-        desiredHeatF: null,
-        desiredCoolF: null,
-        humidity: null,
-        outdoorTemperatureF: null,
-        outdoorHumidity: null,
-        pressureHpa: null,
-        ok: true,
-        ts: nowUtc(),
-        isReachable
-      };
+      // Check if we should force a post due to time elapsed since last post
+      const lastPostedAt = await getLastPostedAt(hvac_id);
+      const timeSinceLastPost = lastPostedAt ? Date.now() - new Date(lastPostedAt).getTime() : Infinity;
+      const shouldForcePostDueToTime = timeSinceLastPost >= MAX_TIME_BETWEEN_POSTS_MS;
 
-      const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
-      if (runtimeResult.postedSessionEnd) {
-        await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
+      // If we need to force a post, fetch full details
+      if (shouldForcePostDueToTime) {
+        console.log(`[${hvac_id}] ⏰ Forcing post (no revision change): ${Math.round(timeSinceLastPost / 1000 / 60 / 60)}h since last post (threshold: ${MAX_TIME_BETWEEN_POSTS_MS / 1000 / 60 / 60}h)`);
+
+        let details = null;
+        try {
+          details = await fetchThermostatDetails(access_token, hvac_id);
+        } catch (e) {
+          console.warn(`[${hvac_id}] ⚠️ details fetch failed for forced post:`, e?.response?.data || e.message);
+        }
+
+        const normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details);
+        const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
+
+        // Post state update
+        const corePayload = buildCorePayload({
+          deviceKey: hvac_id,
+          userId: user_id,
+          deviceName: normalized.thermostatName,
+          firmwareVersion: normalized.firmwareVersion,
+          serialNumber: normalized.serialNumber,
+          eventType: 'STATE_UPDATE',
+          equipmentStatus: parsed.standardizedState || 'Fan_off',
+          previousStatus: 'UNKNOWN',
+          isActive: !!parsed.isRunning,
+          mode: normalized.hvacMode,
+          runtimeSeconds: null,
+          temperatureF: normalized.actualTemperatureF,
+          humidity: normalized.humidity,
+          heatSetpoint: normalized.desiredHeatF,
+          coolSetpoint: normalized.desiredCoolF,
+          thermostatMode: normalized.hvacMode,
+          outdoorTemperatureF: normalized.outdoorTemperatureF,
+          outdoorHumidity: normalized.outdoorHumidity,
+          pressureHpa: normalized.pressureHpa,
+          observedAt: new Date(),
+          sourceEventId: uuidv4(),
+          payloadRaw: normalized
+        });
+
+        try {
+          await postToCoreIngestAsync(corePayload, 'forced-state-update');
+          console.log(`[${hvac_id}] ✓ Posted forced state update to Core`);
+          // Update last_posted_at since we successfully posted
+          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null }, true);
+        } catch (e) {
+          console.error(`[${hvac_id}] ✗ Failed to post forced state update to Core:`, e.message);
+        }
+      } else {
+        // Normal tick without full details
+        const normalized = {
+          userId: user_id,
+          hvacId: hvac_id,
+          thermostatName: null,
+          hvacMode: null,
+          equipmentStatus: equipStatus,
+          ...parseEquipStatus(equipStatus),
+          actualTemperatureF: null,
+          desiredHeatF: null,
+          desiredCoolF: null,
+          humidity: null,
+          outdoorTemperatureF: null,
+          outdoorHumidity: null,
+          pressureHpa: null,
+          ok: true,
+          ts: nowUtc(),
+          isReachable
+        };
+
+        const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
+        if (runtimeResult.postedSessionEnd) {
+          await setLastState(hvac_id, { ...normalized, runtimeSeconds: null });
+        }
       }
     }
   } catch (err) {

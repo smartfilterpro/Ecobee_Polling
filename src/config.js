@@ -10,6 +10,9 @@ export const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000);
 export const ERROR_BACKOFF_MS = Number(process.env.ERROR_BACKOFF_MS || 120_000);
 export const MAX_ACCUMULATE_SECONDS = Number(process.env.MAX_ACCUMULATE_SECONDS || 600);
 
+// Force post at least once every 12 hours, even if values haven't changed
+export const MAX_TIME_BETWEEN_POSTS_MS = Number(process.env.MAX_TIME_BETWEEN_POSTS_MS || 43_200_000); // 12 hours
+
 // Connectivity knobs
 export const REACHABILITY_STALE_MS = Math.max(60_000, Number(process.env.REACHABILITY_STALE_MS || 900_000));
 export const CONNECTIVITY_CHECK_EVERY_MS = Math.max(15_000, Number(process.env.CONNECTIVITY_CHECK_EVERY_MS || 60_000));

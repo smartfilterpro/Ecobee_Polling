@@ -32,6 +32,7 @@ export async function ensureSchema() {
       hvac_id TEXT PRIMARY KEY,
       last_hash TEXT NOT NULL,
       last_payload JSONB NOT NULL,
+      last_posted_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -60,6 +61,7 @@ export async function ensureSchema() {
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_equipment_status TEXT;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS is_reachable BOOLEAN NOT NULL DEFAULT TRUE;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE ecobee_last_state ADD COLUMN IF NOT EXISTS last_posted_at TIMESTAMPTZ;`);
 
   // Add indices for performance
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_tokens_hvac_id ON ecobee_tokens(hvac_id);`);
@@ -121,14 +123,28 @@ export async function getLastHash(hvac_id) {
   return rows[0]?.last_hash || null;
 }
 
-export async function setLastState(hvac_id, payload) {
+export async function getLastPostedAt(hvac_id) {
+  const { rows } = await pool.query(`SELECT last_posted_at FROM ecobee_last_state WHERE hvac_id=$1`, [hvac_id]);
+  return rows[0]?.last_posted_at || null;
+}
+
+export async function setLastState(hvac_id, payload, updatePostedAt = false) {
   const h = sha(payload);
-  await pool.query(
-    `INSERT INTO ecobee_last_state (hvac_id,last_hash,last_payload,updated_at)
-     VALUES ($1,$2,$3,NOW())
-     ON CONFLICT (hvac_id) DO UPDATE SET last_hash=EXCLUDED.last_hash,last_payload=EXCLUDED.last_payload,updated_at=NOW()`,
-    [hvac_id, h, JSON.stringify(payload)]
-  );
+  if (updatePostedAt) {
+    await pool.query(
+      `INSERT INTO ecobee_last_state (hvac_id,last_hash,last_payload,last_posted_at,updated_at)
+       VALUES ($1,$2,$3,NOW(),NOW())
+       ON CONFLICT (hvac_id) DO UPDATE SET last_hash=EXCLUDED.last_hash,last_payload=EXCLUDED.last_payload,last_posted_at=NOW(),updated_at=NOW()`,
+      [hvac_id, h, JSON.stringify(payload)]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO ecobee_last_state (hvac_id,last_hash,last_payload,updated_at)
+       VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (hvac_id) DO UPDATE SET last_hash=EXCLUDED.last_hash,last_payload=EXCLUDED.last_payload,updated_at=NOW()`,
+      [hvac_id, h, JSON.stringify(payload)]
+    );
+  }
   return h;
 }
 
