@@ -1,19 +1,21 @@
-import { 
-  PORT, 
-  CONNECTIVITY_CHECK_EVERY_MS, 
-  REACHABILITY_STALE_MS, 
-  PUBLISH_CONNECTIVITY, 
-  POLL_INTERVAL_MS, 
-  BUBBLE_THERMOSTAT_UPDATES_URL 
+import {
+  PORT,
+  CONNECTIVITY_CHECK_EVERY_MS,
+  REACHABILITY_STALE_MS,
+  PUBLISH_CONNECTIVITY,
+  POLL_INTERVAL_MS,
+  BUBBLE_THERMOSTAT_UPDATES_URL
 } from "./config.js";
 import { ensureSchema, pool, markUnreachableIfStale, closePool } from "./db.js";
 import { buildServer } from "./server.js";
 import { startPoller, stopPoller } from "./poller.js";
 import { postConnectivityChange } from "./bubble.js";
 import { buildCorePayload, postToCoreIngestAsync } from "./coreIngest.js";
+import { scheduleDailyRuntimeValidation } from "./runtimeValidationScheduler.js";
 import { v4 as uuidv4 } from "uuid";
 
 let connectivityInterval;
+let stopRuntimeValidation;
 let isShuttingDown = false;
 
 async function connectivityScanner() {
@@ -91,6 +93,10 @@ async function connectivityScanner() {
     connectivityInterval = setInterval(connectivityScanner, CONNECTIVITY_CHECK_EVERY_MS);
     console.log(`✅ Connectivity scanner started (interval: ${CONNECTIVITY_CHECK_EVERY_MS}ms)`);
 
+    // Start daily runtime validation scheduler
+    stopRuntimeValidation = scheduleDailyRuntimeValidation();
+    console.log(`✅ Runtime validation scheduler started (runs daily at 00:05 UTC)`);
+
     // Graceful shutdown handler
     const shutdown = (signal) => async () => {
       if (isShuttingDown) return;
@@ -106,6 +112,11 @@ async function connectivityScanner() {
         console.log("⏸️  Stopping connectivity scanner...");
         if (connectivityInterval) {
           clearInterval(connectivityInterval);
+        }
+
+        console.log("⏸️  Stopping runtime validation scheduler...");
+        if (stopRuntimeValidation) {
+          stopRuntimeValidation();
         }
         
         // Close HTTP server (waits for existing connections)

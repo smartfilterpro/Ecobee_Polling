@@ -1,6 +1,7 @@
 import express from "express";
 import { pool, upsertTokens } from "./db.js";
 import { nowUtc } from "./util.js";
+import { runValidationNow } from "./runtimeValidationScheduler.js";
 
 export function buildServer() {
   const app = express();
@@ -76,11 +77,35 @@ export function buildServer() {
       await pool.query(`DELETE FROM ecobee_last_state WHERE hvac_id=$1`, [trimmedHvacId]);
       await pool.query(`DELETE FROM ecobee_runtime WHERE hvac_id=$1`, [trimmedHvacId]);
       await pool.query(`DELETE FROM ecobee_revisions WHERE hvac_id=$1`, [trimmedHvacId]);
+      await pool.query(`DELETE FROM ecobee_runtime_reports WHERE hvac_id=$1`, [trimmedHvacId]);
       
       console.log(`[${trimmedHvacId}] 🗑️ unlink cleanup @ ${nowUtc()}`);
       res.json({ ok: true, removed: true });
     } catch (e) {
       console.error("unlink error:", e);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.post("/runtime/validate", async (req, res) => {
+    try {
+      const { hvac_id } = req.body || {};
+
+      console.log(`[RuntimeValidation] Manual validation triggered for ${hvac_id || 'all thermostats'}`);
+
+      // Run validation asynchronously and return immediately
+      runValidationNow(hvac_id).catch(err => {
+        console.error('[RuntimeValidation] Manual validation failed:', err.message);
+      });
+
+      res.json({
+        ok: true,
+        message: 'Runtime validation started',
+        hvac_id: hvac_id || 'all',
+        note: 'Validation running in background - check logs for results'
+      });
+    } catch (e) {
+      console.error("runtime validation error:", e);
       res.status(500).json({ ok: false, error: e.message });
     }
   });

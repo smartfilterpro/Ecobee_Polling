@@ -54,6 +54,27 @@ export async function ensureSchema() {
       last_revision TEXT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS ecobee_runtime_reports (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      hvac_id TEXT NOT NULL,
+      report_date DATE NOT NULL,
+      interval_timestamp TIMESTAMPTZ NOT NULL,
+      aux_heat1 INTEGER DEFAULT 0,
+      aux_heat2 INTEGER DEFAULT 0,
+      aux_heat3 INTEGER DEFAULT 0,
+      comp_cool1 INTEGER DEFAULT 0,
+      comp_cool2 INTEGER DEFAULT 0,
+      comp_heat1 INTEGER DEFAULT 0,
+      comp_heat2 INTEGER DEFAULT 0,
+      fan INTEGER DEFAULT 0,
+      outdoor_temp NUMERIC(5,2),
+      zone_avg_temp NUMERIC(5,2),
+      zone_humidity INTEGER,
+      hvac_mode TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (hvac_id, interval_timestamp)
+    );
   `);
 
   // ensure columns exist (safe no-ops)
@@ -61,6 +82,10 @@ export async function ensureSchema() {
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_equipment_status TEXT;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS is_reachable BOOLEAN NOT NULL DEFAULT TRUE;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_runtime_rev TEXT;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_runtime_rev_changed_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_event_type TEXT;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS pending_mode_change BOOLEAN DEFAULT FALSE;`);
   await pool.query(`ALTER TABLE ecobee_last_state ADD COLUMN IF NOT EXISTS last_posted_at TIMESTAMPTZ;`);
 
   // Add indices for performance
@@ -68,6 +93,8 @@ export async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_tokens_user_id ON ecobee_tokens(user_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_is_reachable ON ecobee_runtime(is_reachable);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_last_seen ON ecobee_runtime(last_seen_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_reports_hvac_date ON ecobee_runtime_reports(hvac_id, report_date);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_reports_timestamp ON ecobee_runtime_reports(interval_timestamp);`);
 }
 
 export async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope }) {
@@ -316,6 +343,81 @@ export async function getBackfillState(hvac_id) {
     console.error('[getBackfillState] error:', err.message);
     return null;
   }
+}
+
+/**
+ * Store runtime report data for a specific interval
+ */
+export async function upsertRuntimeReportInterval(hvac_id, data) {
+  await pool.query(
+    `INSERT INTO ecobee_runtime_reports
+      (hvac_id, report_date, interval_timestamp, aux_heat1, aux_heat2, aux_heat3,
+       comp_cool1, comp_cool2, comp_heat1, comp_heat2, fan, outdoor_temp,
+       zone_avg_temp, zone_humidity, hvac_mode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     ON CONFLICT (hvac_id, interval_timestamp)
+     DO UPDATE SET
+       aux_heat1 = EXCLUDED.aux_heat1,
+       aux_heat2 = EXCLUDED.aux_heat2,
+       aux_heat3 = EXCLUDED.aux_heat3,
+       comp_cool1 = EXCLUDED.comp_cool1,
+       comp_cool2 = EXCLUDED.comp_cool2,
+       comp_heat1 = EXCLUDED.comp_heat1,
+       comp_heat2 = EXCLUDED.comp_heat2,
+       fan = EXCLUDED.fan,
+       outdoor_temp = EXCLUDED.outdoor_temp,
+       zone_avg_temp = EXCLUDED.zone_avg_temp,
+       zone_humidity = EXCLUDED.zone_humidity,
+       hvac_mode = EXCLUDED.hvac_mode`,
+    [
+      hvac_id,
+      data.report_date,
+      data.interval_timestamp,
+      data.aux_heat1 || 0,
+      data.aux_heat2 || 0,
+      data.aux_heat3 || 0,
+      data.comp_cool1 || 0,
+      data.comp_cool2 || 0,
+      data.comp_heat1 || 0,
+      data.comp_heat2 || 0,
+      data.fan || 0,
+      data.outdoor_temp || null,
+      data.zone_avg_temp || null,
+      data.zone_humidity || null,
+      data.hvac_mode || null
+    ]
+  );
+}
+
+/**
+ * Get runtime report data for a specific date
+ */
+export async function getRuntimeReportForDate(hvac_id, date) {
+  const { rows } = await pool.query(
+    `SELECT * FROM ecobee_runtime_reports
+     WHERE hvac_id = $1 AND report_date = $2
+     ORDER BY interval_timestamp`,
+    [hvac_id, date]
+  );
+  return rows;
+}
+
+/**
+ * Get total equipment runtime from report for a date
+ */
+export async function getTotalRuntimeFromReport(hvac_id, date) {
+  const { rows } = await pool.query(
+    `SELECT
+       COALESCE(SUM(aux_heat1), 0) + COALESCE(SUM(aux_heat2), 0) + COALESCE(SUM(aux_heat3), 0) as total_aux_heat,
+       COALESCE(SUM(comp_cool1), 0) + COALESCE(SUM(comp_cool2), 0) as total_cooling,
+       COALESCE(SUM(comp_heat1), 0) + COALESCE(SUM(comp_heat2), 0) as total_heating,
+       COALESCE(SUM(fan), 0) as total_fan,
+       COUNT(*) as interval_count
+     FROM ecobee_runtime_reports
+     WHERE hvac_id = $1 AND report_date = $2`,
+    [hvac_id, date]
+  );
+  return rows[0] || { total_aux_heat: 0, total_cooling: 0, total_heating: 0, total_fan: 0, interval_count: 0 };
 }
 
 export async function closePool() {
