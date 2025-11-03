@@ -4,7 +4,70 @@ import { fetchRuntimeReport } from './ecobeeApi.js';
 import { parseRuntimeReport, getRuntimeSummary } from './runtimeReportParser.js';
 import { upsertRuntimeReportInterval, getTotalRuntimeFromReport, pool } from './db.js';
 import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
+import { CORE_INGEST_URL } from './config.js';
 import { v4 as uuidv4 } from 'uuid';
+import axios from 'axios';
+
+const CORE_API_KEY = process.env.CORE_API_KEY;
+
+/**
+ * Post runtime report intervals to Core Ingest
+ * @param {string} hvac_id - Thermostat identifier
+ * @param {string} date - Date in YYYY-MM-DD format
+ * @param {Array} intervals - Parsed interval data
+ * @returns {Promise<void>}
+ */
+async function postRuntimeReportToCore(hvac_id, date, intervals) {
+  if (!CORE_INGEST_URL) {
+    console.warn('[RuntimeValidator] ⚠️ CORE_INGEST_URL not set, skipping Core post');
+    return;
+  }
+
+  if (!CORE_API_KEY) {
+    console.warn('[RuntimeValidator] ⚠️ CORE_API_KEY missing — posting insecurely (dev only)');
+  }
+
+  const payload = {
+    device_key: hvac_id,
+    report_date: date,
+    intervals: intervals.map(i => ({
+      interval_timestamp: i.interval_timestamp,
+      aux_heat1_seconds: i.aux_heat1 || 0,
+      aux_heat2_seconds: i.aux_heat2 || 0,
+      aux_heat3_seconds: i.aux_heat3 || 0,
+      comp_cool1_seconds: i.comp_cool1 || 0,
+      comp_cool2_seconds: i.comp_cool2 || 0,
+      comp_heat1_seconds: i.comp_heat1 || 0,
+      comp_heat2_seconds: i.comp_heat2 || 0,
+      fan_seconds: i.fan || 0,
+      outdoor_temp_f: i.outdoor_temp,
+      zone_avg_temp_f: i.zone_avg_temp,
+      zone_humidity: i.zone_humidity,
+      hvac_mode: i.hvac_mode
+    }))
+  };
+
+  try {
+    const response = await axios.post(
+      `${CORE_INGEST_URL}/ingest/v1/runtime-report`,
+      payload,
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          ...(CORE_API_KEY ? { 'Authorization': `Bearer ${CORE_API_KEY}` } : {})
+        },
+        timeout: 30000
+      }
+    );
+    console.log(`[RuntimeValidator] ✅ Posted ${intervals.length} intervals to Core for ${hvac_id} on ${date}`);
+    return response.data;
+  } catch (err) {
+    const status = err.response?.status || 'unknown';
+    const msg = err.response?.data?.message || err.message;
+    console.error(`[RuntimeValidator] ❌ Failed to post runtime report to Core [${status}]: ${msg}`);
+    // Don't throw - we still want local storage to succeed even if Core post fails
+  }
+}
 
 /**
  * Fetch and store runtime report data from Ecobee for a specific date
@@ -34,6 +97,9 @@ export async function fetchAndStoreRuntimeReport(access_token, hvac_id, date) {
       await upsertRuntimeReportInterval(hvac_id, interval);
       stored++;
     }
+
+    // Post intervals to Core Ingest
+    await postRuntimeReportToCore(hvac_id, date, intervals);
 
     // Get summary
     const summary = getRuntimeSummary(intervals);
