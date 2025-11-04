@@ -41,15 +41,31 @@ export function parseConnectedFromRevision(revisionString) {
 }
 
 /**
+ * Parse the runtimeRev from the revision string
+ * Format: "identifier:name:connected:thermostatRev:alertsRev:runtimeRev:intervalRev"
+ * @returns {string|null} - runtimeRev or null if not found
+ */
+export function parseRuntimeRevFromRevision(revisionString) {
+  if (!revisionString) return null;
+  const parts = revisionString.split(":");
+  if (parts.length >= 6) {
+    return parts[5] || null;
+  }
+  return null;
+}
+
+/**
  * Normalize full thermostat data from Ecobee details API
  * Includes indoor temp/humidity, outdoor weather, firmware, and serial metadata.
  *
  * @param {object} args - { user_id, hvac_id, isReachable }
  * @param {string} equipStatus - raw equipment status string
  * @param {object} details - response body from fetchThermostatDetails()
+ * @param {string} revisionString - full revision string from Ecobee (optional)
  */
-export function normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details) {
+export function normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details, revisionString = null) {
   const parsed = parseEquipStatus(equipStatus);
+  const runtimeRev = parseRuntimeRevFromRevision(revisionString);
 
   let actualTemperatureF = null;
   let desiredHeatF = null;
@@ -124,6 +140,7 @@ export function normalizeFromDetails({ user_id, hvac_id, isReachable }, equipSta
     firmwareVersion,
     serialNumber,
     modelNumber,
+    runtimeRev,
 
     ok: true,
     ts: new Date().toISOString(),

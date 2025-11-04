@@ -110,5 +110,41 @@ export function buildServer() {
     }
   });
 
+  app.get("/runtime/debug/:hvac_id", async (req, res) => {
+    try {
+      const { hvac_id } = req.params;
+
+      // Get runtime state
+      const rtResult = await pool.query(
+        `SELECT * FROM ecobee_runtime WHERE hvac_id = $1`,
+        [hvac_id]
+      );
+
+      // Get today's runtime report summary
+      const today = new Date().toISOString().split('T')[0];
+      const reportResult = await pool.query(
+        `SELECT
+          COUNT(*) as interval_count,
+          SUM(aux_heat1 + aux_heat2 + aux_heat3) as total_aux_heat_seconds,
+          SUM(comp_cool1 + comp_cool2) as total_cooling_seconds,
+          SUM(comp_heat1 + comp_heat2) as total_heating_seconds,
+          SUM(fan) as total_fan_seconds
+        FROM ecobee_runtime_reports
+        WHERE hvac_id = $1 AND report_date = $2`,
+        [hvac_id, today]
+      );
+
+      res.json({
+        ok: true,
+        hvac_id,
+        runtime_state: rtResult.rows[0] || null,
+        todays_report: reportResult.rows[0] || null
+      });
+    } catch (e) {
+      console.error("runtime debug error:", e);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
   return app;
 }
