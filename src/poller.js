@@ -153,7 +153,7 @@ async function processThermostat(row) {
         console.warn(`[${hvac_id}] ⚠️ details fetch failed:`, e?.response?.data || e.message);
       }
 
-      const normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details);
+      const normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details, currentRev);
 
       // Handle runtime and post to Core if session ends
       const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
@@ -245,7 +245,7 @@ async function processThermostat(row) {
           console.warn(`[${hvac_id}] ⚠️ details fetch failed for forced post:`, e?.response?.data || e.message);
         }
 
-        const normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details);
+        const normalized = normalizeFromDetails({ user_id, hvac_id, isReachable }, equipStatus, details, currentRev);
         const runtimeResult = await handleRuntimeAndMaybePost({ user_id, hvac_id }, normalized);
 
         // Post state update
