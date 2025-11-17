@@ -420,6 +420,43 @@ export async function getTotalRuntimeFromReport(hvac_id, date) {
   return rows[0] || { total_aux_heat: 0, total_cooling: 0, total_heating: 0, total_fan: 0, interval_count: 0 };
 }
 
+/**
+ * Get all hvac_ids for a given user_id
+ */
+export async function getHvacIdsForUser(user_id) {
+  const { rows } = await pool.query(
+    `SELECT hvac_id FROM ecobee_tokens WHERE user_id = $1`,
+    [user_id]
+  );
+  return rows.map(row => row.hvac_id);
+}
+
+/**
+ * Delete a single thermostat and all its associated data
+ */
+export async function deleteThermostat(hvac_id) {
+  await pool.query(`DELETE FROM ecobee_tokens WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM ecobee_last_state WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM ecobee_runtime WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM ecobee_revisions WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM ecobee_runtime_reports WHERE hvac_id=$1`, [hvac_id]);
+}
+
+/**
+ * Delete a user and all their thermostats
+ */
+export async function deleteUser(user_id) {
+  // Get all hvac_ids for this user first
+  const hvacIds = await getHvacIdsForUser(user_id);
+
+  // Delete all thermostats for this user
+  for (const hvac_id of hvacIds) {
+    await deleteThermostat(hvac_id);
+  }
+
+  return hvacIds;
+}
+
 export async function closePool() {
   await pool.end();
 }

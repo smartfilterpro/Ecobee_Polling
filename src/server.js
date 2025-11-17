@@ -1,11 +1,29 @@
 import express from "express";
-import { pool, upsertTokens } from "./db.js";
+import { pool, upsertTokens, deleteUser, deleteThermostat } from "./db.js";
 import { nowUtc } from "./util.js";
 import { runValidationNow } from "./runtimeValidationScheduler.js";
+import { CORE_API_KEY } from "./config.js";
 
 export function buildServer() {
   const app = express();
   app.use(express.json({ limit: "1mb" }));
+
+  // Authentication middleware
+  const requireApiKey = (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    const providedKey = authHeader?.replace(/^Bearer\s+/i, "");
+
+    if (!CORE_API_KEY) {
+      console.error("CORE_API_KEY not configured - rejecting request");
+      return res.status(500).json({ ok: false, error: "Server authentication not configured" });
+    }
+
+    if (!providedKey || providedKey !== CORE_API_KEY) {
+      return res.status(401).json({ ok: false, error: "Unauthorized - invalid or missing API key" });
+    }
+
+    next();
+  };
 
   app.get("/health", async (_req, res) => {
     try {
@@ -16,7 +34,7 @@ export function buildServer() {
     }
   });
 
-  app.post("/ecobee/link", async (req, res) => {
+  app.post("/ecobee/link", requireApiKey, async (req, res) => {
     try {
       const { user_id, hvac_id, access_token, refresh_token, expires_in, scope } = req.body || {};
       
@@ -58,7 +76,7 @@ export function buildServer() {
     }
   });
 
-  app.post("/ecobee/unlink", async (req, res) => {
+  app.post("/ecobee/unlink", requireApiKey, async (req, res) => {
     try {
       const { user_id, hvac_id } = req.body || {};
       
@@ -87,7 +105,7 @@ export function buildServer() {
     }
   });
 
-  app.post("/runtime/validate", async (req, res) => {
+  app.post("/runtime/validate", requireApiKey, async (req, res) => {
     try {
       const { hvac_id } = req.body || {};
 
@@ -110,7 +128,7 @@ export function buildServer() {
     }
   });
 
-  app.get("/runtime/debug/:hvac_id", async (req, res) => {
+  app.get("/runtime/debug/:hvac_id", requireApiKey, async (req, res) => {
     try {
       const { hvac_id } = req.params;
 
@@ -142,6 +160,54 @@ export function buildServer() {
       });
     } catch (e) {
       console.error("runtime debug error:", e);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.delete("/user/:user_id", requireApiKey, async (req, res) => {
+    try {
+      const { user_id } = req.params;
+
+      if (!user_id || typeof user_id !== 'string' || !user_id.trim()) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing user_id" });
+      }
+
+      const trimmedUserId = user_id.trim();
+      const deletedHvacIds = await deleteUser(trimmedUserId);
+
+      console.log(`[${trimmedUserId}] 🗑️ user deletion - removed ${deletedHvacIds.length} thermostats @ ${nowUtc()}`);
+      res.json({
+        ok: true,
+        removed: true,
+        user_id: trimmedUserId,
+        thermostats_deleted: deletedHvacIds.length,
+        hvac_ids: deletedHvacIds
+      });
+    } catch (e) {
+      console.error("user delete error:", e);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.delete("/thermostat/:hvac_id", requireApiKey, async (req, res) => {
+    try {
+      const { hvac_id } = req.params;
+
+      if (!hvac_id || typeof hvac_id !== 'string' || !hvac_id.trim()) {
+        return res.status(400).json({ ok: false, error: "Invalid or missing hvac_id" });
+      }
+
+      const trimmedHvacId = hvac_id.trim();
+      await deleteThermostat(trimmedHvacId);
+
+      console.log(`[${trimmedHvacId}] 🗑️ thermostat deletion @ ${nowUtc()}`);
+      res.json({
+        ok: true,
+        removed: true,
+        hvac_id: trimmedHvacId
+      });
+    } catch (e) {
+      console.error("thermostat delete error:", e);
       res.status(500).json({ ok: false, error: e.message });
     }
   });
