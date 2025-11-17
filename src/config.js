@@ -29,3 +29,5 @@ export const CORE_POST_RETRY_DELAY_MS = Number(process.env.CORE_POST_RETRY_DELAY
 
 export const DATABASE_URL = process.env.DATABASE_URL;
 export const PGSSLMODE = process.env.PGSSLMODE;
+
+export const CORE_API_KEY = (process.env.CORE_API_KEY || "").trim();
