@@ -25,12 +25,42 @@ export function parseRuntimeReport(reportData, hvac_id) {
     return [];
   }
 
-  const columns = reportData.columns?.split(',') || [];
   const rows = thermostatReport.rowList;
+
+  // Extract column names from the first row (header row) if available
+  // The Ecobee API returns CSV data where the first row contains column headers:
+  // "Date,Time,auxHeat1,auxHeat2,auxHeat3,compCool1,compCool2,compHeat1,compHeat2,fan,..."
+  let columns = [];
+  let dataRows = rows;
+
+  if (rows.length > 0) {
+    const firstRow = rows[0];
+    const firstRowValues = firstRow.split(',');
+
+    // Check if first row is a header (contains column names like "auxHeat1" instead of data)
+    // Headers start with "Date,Time,..." and contain column names
+    if (firstRowValues[0] === 'Date' && firstRowValues[1] === 'Time') {
+      // First row is the header - extract column names (skip Date and Time)
+      columns = firstRowValues.slice(2).map((col) => col.trim());
+      dataRows = rows.slice(1); // Skip header row for data processing
+      console.log(`[parseRuntimeReport] Extracted ${columns.length} columns from header: ${columns.join(', ')}`);
+    } else {
+      // No header row found - use default column order based on Ecobee API documentation
+      columns = [
+        'auxHeat1', 'auxHeat2', 'auxHeat3',
+        'compCool1', 'compCool2',
+        'compHeat1', 'compHeat2',
+        'fan',
+        'outdoorTemp', 'zoneAveTemp', 'zoneHumidity',
+        'hvacMode'
+      ];
+      console.log('[parseRuntimeReport] No header row found, using default columns');
+    }
+  }
 
   const intervals = [];
 
-  for (const row of rows) {
+  for (const row of dataRows) {
     const values = row.split(',');
 
     // First two columns are always Date and Time
