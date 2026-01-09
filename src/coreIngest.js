@@ -85,10 +85,19 @@ export function buildCorePayload({
     zip_code_prefix: zipPrefix,
 
     last_mode: mode || null,
-    last_is_cooling: equipmentStatus === "Cooling_on" || equipmentStatus === "Cooling_Fan",
-    last_is_heating: equipmentStatus === "Heating_on" || equipmentStatus === "Heating_Fan" || 
-                     equipmentStatus === "AuxHeat" || equipmentStatus === "AuxHeat_Fan",
-    last_is_fan_only: equipmentStatus === "Fan_only",
+    // When transitioning to IDLE, use previousStatus to determine what session type just ended
+    // This ensures runtime_seconds is correctly associated with the session type
+    last_is_cooling: equipmentStatus === "IDLE"
+      ? (previousStatus === "Cooling" || previousStatus === "Cooling_Fan")
+      : (equipmentStatus === "Cooling" || equipmentStatus === "Cooling_Fan"),
+    last_is_heating: equipmentStatus === "IDLE"
+      ? (previousStatus === "Heating" || previousStatus === "Heating_Fan" ||
+         previousStatus === "AuxHeat" || previousStatus === "AuxHeat_Fan")
+      : (equipmentStatus === "Heating" || equipmentStatus === "Heating_Fan" ||
+         equipmentStatus === "AuxHeat" || equipmentStatus === "AuxHeat_Fan"),
+    last_is_fan_only: equipmentStatus === "IDLE"
+      ? previousStatus === "Fan_only"
+      : equipmentStatus === "Fan_only",
     last_equipment_status: equipmentStatus || null,
     is_reachable: isReachable,
 
