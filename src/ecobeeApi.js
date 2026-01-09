@@ -65,7 +65,8 @@ export async function fetchRuntimeReport(access_token, hvac_id, startDate, endDa
     startDate,
     endDate: endDateToUse,
     columns: columnsToUse.join(','),
-    includeSensors: false
+    includeSensors: false,
+    includeHeaders: true  // Include header row with column names in rowList
   };
 
   const url = "https://api.ecobee.com/1/runtimeReport?json=" + encodeURIComponent(JSON.stringify(q));
