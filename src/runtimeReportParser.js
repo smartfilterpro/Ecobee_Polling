@@ -27,6 +27,15 @@ export function parseRuntimeReport(reportData, hvac_id) {
 
   const rows = thermostatReport.rowList;
 
+  // Debug: Log first few raw rows to see what Ecobee returns
+  console.log(`[parseRuntimeReport] Raw row count: ${rows.length}`);
+  if (rows.length > 0) {
+    console.log(`[parseRuntimeReport] First raw row: ${rows[0]}`);
+    if (rows.length > 1) {
+      console.log(`[parseRuntimeReport] Second raw row: ${rows[1]}`);
+    }
+  }
+
   // Extract column names from the first row (header row) if available
   // The Ecobee API returns CSV data where the first row contains column headers:
   // "Date,Time,auxHeat1,auxHeat2,auxHeat3,compCool1,compCool2,compHeat1,compHeat2,fan,..."
@@ -112,6 +121,20 @@ export function parseRuntimeReport(reportData, hvac_id) {
     };
 
     intervals.push(interval);
+  }
+
+  // Debug: Log first interval with non-zero runtime (or first interval if all zero)
+  const nonZeroInterval = intervals.find(i =>
+    i.aux_heat1 > 0 || i.aux_heat2 > 0 || i.aux_heat3 > 0 ||
+    i.comp_cool1 > 0 || i.comp_cool2 > 0 ||
+    i.comp_heat1 > 0 || i.comp_heat2 > 0 ||
+    i.fan > 0
+  );
+  if (nonZeroInterval) {
+    console.log(`[parseRuntimeReport] Sample interval with runtime:`, JSON.stringify(nonZeroInterval));
+  } else if (intervals.length > 0) {
+    console.log(`[parseRuntimeReport] WARNING: All ${intervals.length} intervals have zero runtime values`);
+    console.log(`[parseRuntimeReport] First interval:`, JSON.stringify(intervals[0]));
   }
 
   console.log(`[parseRuntimeReport] Parsed ${intervals.length} intervals for ${hvac_id} on ${intervals[0]?.report_date || 'unknown date'}`);
