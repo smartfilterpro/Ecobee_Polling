@@ -2,7 +2,7 @@
 
 import { fetchRuntimeReport } from './ecobeeApi.js';
 import { parseRuntimeReport, getRuntimeSummary } from './runtimeReportParser.js';
-import { upsertRuntimeReportInterval, getTotalRuntimeFromReport, pool } from './db.js';
+import { upsertRuntimeReportInterval, getTotalRuntimeFromReport, getTotalRuntimeFromSessions } from './db.js';
 import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
 import { CORE_INGEST_URL } from './config.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -127,26 +127,15 @@ export async function fetchAndStoreRuntimeReport(access_token, hvac_id, date) {
  * @returns {Promise<object>} Calculated runtime totals
  */
 export async function getCalculatedRuntimeForDate(hvac_id, date) {
-  // Query for all sessions that occurred on this date
-  // Note: This is a simplified version - you may need to adjust based on your actual session tracking
-  const startOfDay = `${date}T00:00:00Z`;
-  const endOfDay = `${date}T23:59:59Z`;
+  // Query the ecobee_runtime_sessions table for sessions that started on this date
+  const sessionTotals = await getTotalRuntimeFromSessions(hvac_id, date);
 
-  // Since we don't have a sessions table, we'll need to query the last_state table
-  // This is an approximation - ideally you'd store session history
-  const { rows } = await pool.query(
-    `SELECT last_payload FROM ecobee_last_state WHERE hvac_id = $1`,
-    [hvac_id]
-  );
-
-  // This is a placeholder - you'd need to implement proper session history tracking
-  // For now, we'll return zero to show the structure
   return {
-    total_heating: 0,
-    total_cooling: 0,
-    total_aux_heat: 0,
-    total_fan: 0,
-    note: 'Session history tracking not yet implemented - values are zero'
+    total_heating: Number(sessionTotals.total_heating) || 0,
+    total_cooling: Number(sessionTotals.total_cooling) || 0,
+    total_aux_heat: Number(sessionTotals.total_aux_heat) || 0,
+    total_fan: Number(sessionTotals.total_fan) || 0,
+    session_count: Number(sessionTotals.session_count) || 0
   };
 }
 

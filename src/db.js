@@ -75,6 +75,20 @@ export async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (hvac_id, interval_timestamp)
     );
+
+    CREATE TABLE IF NOT EXISTS ecobee_runtime_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      hvac_id TEXT NOT NULL,
+      user_id TEXT,
+      started_at TIMESTAMPTZ NOT NULL,
+      ended_at TIMESTAMPTZ NOT NULL,
+      runtime_seconds INTEGER NOT NULL,
+      equipment_type TEXT NOT NULL,
+      avg_temperature NUMERIC(5,2),
+      avg_humidity INTEGER,
+      thermostat_mode TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
   // ensure columns exist (safe no-ops)
@@ -95,6 +109,8 @@ export async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_last_seen ON ecobee_runtime(last_seen_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_reports_hvac_date ON ecobee_runtime_reports(hvac_id, report_date);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_reports_timestamp ON ecobee_runtime_reports(interval_timestamp);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_sessions_hvac_date ON ecobee_runtime_sessions(hvac_id, started_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_sessions_ended_at ON ecobee_runtime_sessions(ended_at);`);
 }
 
 export async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope }) {
@@ -421,6 +437,77 @@ export async function getTotalRuntimeFromReport(hvac_id, date) {
 }
 
 /**
+ * Insert a completed runtime session
+ */
+export async function insertSession(data) {
+  const { rows } = await pool.query(
+    `INSERT INTO ecobee_runtime_sessions
+      (hvac_id, user_id, started_at, ended_at, runtime_seconds, equipment_type,
+       avg_temperature, avg_humidity, thermostat_mode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     RETURNING id`,
+    [
+      data.hvac_id,
+      data.user_id || null,
+      data.started_at,
+      data.ended_at,
+      data.runtime_seconds,
+      data.equipment_type,
+      data.avg_temperature || null,
+      data.avg_humidity || null,
+      data.thermostat_mode || null
+    ]
+  );
+  return rows[0]?.id;
+}
+
+/**
+ * Get sessions for a specific date range (for runtime validation)
+ * @param {string} hvac_id - Thermostat identifier
+ * @param {string} startTime - Start of range (ISO string)
+ * @param {string} endTime - End of range (ISO string)
+ * @returns {Promise<Array>} Array of session records
+ */
+export async function getSessionsForDateRange(hvac_id, startTime, endTime) {
+  const { rows } = await pool.query(
+    `SELECT * FROM ecobee_runtime_sessions
+     WHERE hvac_id = $1
+       AND started_at >= $2
+       AND started_at < $3
+     ORDER BY started_at`,
+    [hvac_id, startTime, endTime]
+  );
+  return rows;
+}
+
+/**
+ * Get total runtime from sessions for a specific date
+ * @param {string} hvac_id - Thermostat identifier
+ * @param {string} date - Date in YYYY-MM-DD format
+ * @returns {Promise<object>} Runtime totals by equipment type
+ */
+export async function getTotalRuntimeFromSessions(hvac_id, date) {
+  const startOfDay = `${date}T00:00:00Z`;
+  const endOfDay = `${date}T23:59:59.999Z`;
+
+  const { rows } = await pool.query(
+    `SELECT
+       COALESCE(SUM(CASE WHEN equipment_type IN ('Heating', 'Heating_Fan') THEN runtime_seconds ELSE 0 END), 0) as total_heating,
+       COALESCE(SUM(CASE WHEN equipment_type IN ('Cooling', 'Cooling_Fan') THEN runtime_seconds ELSE 0 END), 0) as total_cooling,
+       COALESCE(SUM(CASE WHEN equipment_type IN ('AuxHeat', 'AuxHeat_Fan') THEN runtime_seconds ELSE 0 END), 0) as total_aux_heat,
+       COALESCE(SUM(CASE WHEN equipment_type = 'Fan_only' THEN runtime_seconds ELSE 0 END), 0) as total_fan,
+       COUNT(*) as session_count
+     FROM ecobee_runtime_sessions
+     WHERE hvac_id = $1
+       AND started_at >= $2
+       AND started_at < $3`,
+    [hvac_id, startOfDay, endOfDay]
+  );
+
+  return rows[0] || { total_heating: 0, total_cooling: 0, total_aux_heat: 0, total_fan: 0, session_count: 0 };
+}
+
+/**
  * Get all hvac_ids for a given user_id
  */
 export async function getHvacIdsForUser(user_id) {
@@ -440,6 +527,7 @@ export async function deleteThermostat(hvac_id) {
   await pool.query(`DELETE FROM ecobee_runtime WHERE hvac_id=$1`, [hvac_id]);
   await pool.query(`DELETE FROM ecobee_revisions WHERE hvac_id=$1`, [hvac_id]);
   await pool.query(`DELETE FROM ecobee_runtime_reports WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM ecobee_runtime_sessions WHERE hvac_id=$1`, [hvac_id]);
 }
 
 /**
