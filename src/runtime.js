@@ -2,7 +2,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { nowUtc, toMillis } from './util.js';
-import { getRuntime, setRuntime, resetRuntime, getBackfillState } from './db.js';
+import { getRuntime, setRuntime, resetRuntime, getBackfillState, insertSession } from './db.js';
 import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
 import { MAX_ACCUMULATE_SECONDS } from './config.js';
 
@@ -133,6 +133,27 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
         observedAt: new Date(nowIso),
       });
       await postToCoreIngestAsync(payload, 'offline-session-end');
+
+      // Persist session to database for runtime validation
+      if (rt.current_session_started_at && total > 0) {
+        try {
+          await insertSession({
+            hvac_id,
+            user_id,
+            started_at: rt.current_session_started_at,
+            ended_at: nowIso,
+            runtime_seconds: total,
+            equipment_type: prevEquipStatus,
+            avg_temperature: temperatureF,
+            avg_humidity: humidity,
+            thermostat_mode: thermostatMode,
+          });
+          console.log(`[${hvac_id}] 💾 Persisted offline session: ${prevEquipStatus} for ${total}s`);
+        } catch (err) {
+          console.error(`[${hvac_id}] Failed to persist offline session:`, err.message);
+        }
+      }
+
       await resetRuntime(hvac_id);
     }
 
@@ -242,6 +263,27 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
       observedAt: new Date(nowIso),
     });
     await postToCoreIngestAsync(payload, 'session-end');
+
+    // Persist session to database for runtime validation
+    if (rt.current_session_started_at && total > 0) {
+      try {
+        await insertSession({
+          hvac_id,
+          user_id,
+          started_at: rt.current_session_started_at,
+          ended_at: nowIso,
+          runtime_seconds: total,
+          equipment_type: prevEquipStatus,
+          avg_temperature: temperatureF,
+          avg_humidity: humidity,
+          thermostat_mode: thermostatMode,
+        });
+        console.log(`[${hvac_id}] 💾 Persisted session: ${prevEquipStatus} for ${total}s`);
+      } catch (err) {
+        console.error(`[${hvac_id}] Failed to persist session:`, err.message);
+      }
+    }
+
     await setRuntime(hvac_id, {
       last_equipment_status: 'IDLE',
       last_temperature: temperatureF,
