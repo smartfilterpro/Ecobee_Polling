@@ -2,7 +2,7 @@
 
 import { fetchRuntimeReport } from './ecobeeApi.js';
 import { parseRuntimeReport, getRuntimeSummary } from './runtimeReportParser.js';
-import { upsertRuntimeReportInterval, getTotalRuntimeFromReport, getTotalRuntimeFromSessions } from './db.js';
+import { upsertRuntimeReportInterval, getTotalRuntimeFromReport, getTotalRuntimeFromSessions, insertCoreEvent } from './db.js';
 import { buildCorePayload, postToCoreIngestAsync } from './coreIngest.js';
 import { CORE_INGEST_URL } from './config.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -60,6 +60,17 @@ async function postRuntimeReportToCore(hvac_id, date, intervals) {
       }
     );
     console.log(`[RuntimeValidator] ✅ Posted ${intervals.length} intervals to Core for ${hvac_id} on ${date}`);
+
+    // Store the runtime report post locally
+    await insertCoreEvent({
+      hvac_id,
+      user_id: null,
+      event_type: 'RUNTIME_REPORT',
+      source_event_id: null,
+      label: 'runtime-report',
+      payload
+    });
+
     return response.data;
   } catch (err) {
     const status = err.response?.status || 'unknown';

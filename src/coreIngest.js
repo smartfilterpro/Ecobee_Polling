@@ -6,6 +6,7 @@ import {
   CORE_POST_RETRY_DELAY_MS
 } from "./config.js";
 import { nowUtc, sleep } from "./util.js";
+import { insertCoreEvent } from "./db.js";
 
 const CORE_API_KEY = process.env.CORE_API_KEY;
 
@@ -160,6 +161,19 @@ export async function postToCoreIngestAsync(payload, label = "event") {
     try {
       await axios.post(endpoint, body, { timeout: 20_000, headers });
       console.log(`[${body[0]?.device_key}] ✅ Posted to Core (${label}) ${nowUtc()}`);
+
+      // Store each event locally in the database
+      for (const event of body) {
+        await insertCoreEvent({
+          hvac_id: event.device_key,
+          user_id: event.user_id,
+          event_type: event.event_type || label,
+          source_event_id: event.source_event_id,
+          label,
+          payload: event
+        });
+      }
+
       return;
     } catch (err) {
       lastError = err;
