@@ -89,6 +89,18 @@ export async function ensureSchema() {
       thermostat_mode TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS core_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      hvac_id TEXT NOT NULL,
+      user_id TEXT,
+      event_type TEXT NOT NULL,
+      source_event_id TEXT,
+      label TEXT,
+      payload JSONB NOT NULL,
+      posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
   // ensure columns exist (safe no-ops)
@@ -111,6 +123,10 @@ export async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_reports_timestamp ON ecobee_runtime_reports(interval_timestamp);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_sessions_hvac_date ON ecobee_runtime_sessions(hvac_id, started_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_sessions_ended_at ON ecobee_runtime_sessions(ended_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_core_events_hvac_id ON core_events(hvac_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_core_events_event_type ON core_events(event_type);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_core_events_posted_at ON core_events(posted_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_core_events_hvac_posted ON core_events(hvac_id, posted_at);`);
 }
 
 export async function upsertTokens({ user_id, hvac_id, access_token, refresh_token, expires_in, scope }) {
@@ -462,6 +478,28 @@ export async function insertSession(data) {
 }
 
 /**
+ * Insert a core event record (mirrors what was posted to Core Ingest)
+ */
+export async function insertCoreEvent({ hvac_id, user_id, event_type, source_event_id, label, payload }) {
+  try {
+    await pool.query(
+      `INSERT INTO core_events (hvac_id, user_id, event_type, source_event_id, label, payload, posted_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [
+        hvac_id,
+        user_id || null,
+        event_type,
+        source_event_id || null,
+        label || null,
+        JSON.stringify(payload)
+      ]
+    );
+  } catch (err) {
+    console.error(`[${hvac_id}] Failed to store core event locally:`, err.message);
+  }
+}
+
+/**
  * Get sessions for a specific date range (for runtime validation)
  * @param {string} hvac_id - Thermostat identifier
  * @param {string} startTime - Start of range (ISO string)
@@ -528,6 +566,7 @@ export async function deleteThermostat(hvac_id) {
   await pool.query(`DELETE FROM ecobee_revisions WHERE hvac_id=$1`, [hvac_id]);
   await pool.query(`DELETE FROM ecobee_runtime_reports WHERE hvac_id=$1`, [hvac_id]);
   await pool.query(`DELETE FROM ecobee_runtime_sessions WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM core_events WHERE hvac_id=$1`, [hvac_id]);
 }
 
 /**
