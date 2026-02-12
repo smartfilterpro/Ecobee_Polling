@@ -6,7 +6,7 @@ import {
   POLL_INTERVAL_MS,
   BUBBLE_THERMOSTAT_UPDATES_URL
 } from "./config.js";
-import { ensureSchema, pool, markUnreachableIfStale, closePool } from "./db.js";
+import { ensureSchema, pool, markUnreachableIfStale, closePool, cleanupOutboundEventLog } from "./db.js";
 import { buildServer } from "./server.js";
 import { startPoller, stopPoller } from "./poller.js";
 import { postConnectivityChange } from "./bubble.js";
@@ -15,8 +15,11 @@ import { scheduleDailyRuntimeValidation } from "./runtimeValidationScheduler.js"
 import { v4 as uuidv4 } from "uuid";
 
 let connectivityInterval;
+let eventLogCleanupInterval;
 let stopRuntimeValidation;
 let isShuttingDown = false;
+
+const EVENT_LOG_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once per day
 
 async function connectivityScanner() {
   if (isShuttingDown) return;
@@ -97,6 +100,16 @@ async function connectivityScanner() {
     stopRuntimeValidation = scheduleDailyRuntimeValidation();
     console.log(`✅ Runtime validation scheduler started (runs daily at 00:05 UTC)`);
 
+    // Start outbound event log cleanup (daily, 7-day retention)
+    eventLogCleanupInterval = setInterval(() => {
+      cleanupOutboundEventLog().catch(e =>
+        console.warn("[EventLog] Cleanup error:", e.message)
+      );
+    }, EVENT_LOG_CLEANUP_INTERVAL_MS);
+    // Run once on startup to clear any stale entries
+    cleanupOutboundEventLog().catch(() => {});
+    console.log(`✅ Outbound event log cleanup scheduled (daily, 7-day retention)`);
+
     // Graceful shutdown handler
     const shutdown = (signal) => async () => {
       if (isShuttingDown) return;
@@ -117,6 +130,11 @@ async function connectivityScanner() {
         console.log("⏸️  Stopping runtime validation scheduler...");
         if (stopRuntimeValidation) {
           stopRuntimeValidation();
+        }
+
+        console.log("⏸️  Stopping event log cleanup...");
+        if (eventLogCleanupInterval) {
+          clearInterval(eventLogCleanupInterval);
         }
         
         // Close HTTP server (waits for existing connections)

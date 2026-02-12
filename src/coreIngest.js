@@ -6,7 +6,7 @@ import {
   CORE_POST_RETRY_DELAY_MS
 } from "./config.js";
 import { nowUtc, sleep } from "./util.js";
-import { insertCoreEvent } from "./db.js";
+import { insertCoreEvent, allocateSequenceNumber, insertOutboundEventLog } from "./db.js";
 
 const CORE_API_KEY = process.env.CORE_API_KEY;
 
@@ -155,6 +155,24 @@ export async function postToCoreIngestAsync(payload, label = "event") {
 
   // Core expects a flat array of events
   const body = Array.isArray(payload) ? payload : [payload];
+
+  // Allocate sequence numbers and log events before POSTing
+  for (const event of body) {
+    try {
+      const deviceKey = event.device_key;
+      if (deviceKey) {
+        const seq = await allocateSequenceNumber(deviceKey);
+        if (seq !== null) {
+          event.sequence_number = seq;
+          await insertOutboundEventLog(deviceKey, seq, event);
+        }
+      }
+    } catch (err) {
+      console.warn(`[${event.device_key}] ⚠️ Failed to allocate sequence number: ${err.message}`);
+      // Continue without sequence_number — backwards compatible
+    }
+  }
+
   let lastError;
 
   for (let attempt = 0; attempt < CORE_POST_RETRIES; attempt++) {

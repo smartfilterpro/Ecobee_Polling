@@ -90,6 +90,15 @@ export async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS outbound_event_log (
+      id SERIAL PRIMARY KEY,
+      device_key VARCHAR(255) NOT NULL,
+      sequence_number INTEGER NOT NULL,
+      event_payload JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (device_key, sequence_number)
+    );
+
     CREATE TABLE IF NOT EXISTS core_events (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       hvac_id TEXT NOT NULL,
@@ -112,6 +121,7 @@ export async function ensureSchema() {
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_runtime_rev_changed_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_event_type TEXT;`);
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS pending_mode_change BOOLEAN DEFAULT FALSE;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS next_sequence_number INTEGER NOT NULL DEFAULT 1;`);
   await pool.query(`ALTER TABLE ecobee_last_state ADD COLUMN IF NOT EXISTS last_posted_at TIMESTAMPTZ;`);
 
   // Add indices for performance
@@ -123,6 +133,8 @@ export async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_reports_timestamp ON ecobee_runtime_reports(interval_timestamp);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_sessions_hvac_date ON ecobee_runtime_sessions(hvac_id, started_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_runtime_sessions_ended_at ON ecobee_runtime_sessions(ended_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_outbound_log_device_seq ON outbound_event_log(device_key, sequence_number);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_outbound_log_created ON outbound_event_log(created_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_core_events_hvac_id ON core_events(hvac_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_core_events_event_type ON core_events(event_type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_core_events_posted_at ON core_events(posted_at);`);
@@ -567,6 +579,7 @@ export async function deleteThermostat(hvac_id) {
   await pool.query(`DELETE FROM ecobee_runtime_reports WHERE hvac_id=$1`, [hvac_id]);
   await pool.query(`DELETE FROM ecobee_runtime_sessions WHERE hvac_id=$1`, [hvac_id]);
   await pool.query(`DELETE FROM core_events WHERE hvac_id=$1`, [hvac_id]);
+  await pool.query(`DELETE FROM outbound_event_log WHERE device_key=$1`, [hvac_id]);
 }
 
 /**
@@ -582,6 +595,69 @@ export async function deleteUser(user_id) {
   }
 
   return hvacIds;
+}
+
+/**
+ * Atomically allocate the next sequence number for a device.
+ * Returns the allocated sequence number (starts at 1).
+ * @param {string} hvac_id - Device identifier (used as device_key)
+ * @returns {Promise<number|null>} The allocated sequence number, or null if device not found
+ */
+export async function allocateSequenceNumber(hvac_id) {
+  const { rows } = await pool.query(
+    `UPDATE ecobee_runtime
+     SET next_sequence_number = next_sequence_number + 1
+     WHERE hvac_id = $1
+     RETURNING next_sequence_number - 1 AS sequence_number`,
+    [hvac_id]
+  );
+  return rows[0]?.sequence_number ?? null;
+}
+
+/**
+ * Insert an event into the outbound event log for backfill replay.
+ * @param {string} device_key - Device identifier
+ * @param {number} sequence_number - The sequence number for this event
+ * @param {object} event_payload - The full event payload as sent to Core
+ */
+export async function insertOutboundEventLog(device_key, sequence_number, event_payload) {
+  await pool.query(
+    `INSERT INTO outbound_event_log (device_key, sequence_number, event_payload)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (device_key, sequence_number) DO NOTHING`,
+    [device_key, sequence_number, JSON.stringify(event_payload)]
+  );
+}
+
+/**
+ * Query outbound event log for backfill replay.
+ * @param {string} device_key - Device identifier
+ * @param {number} seq_start - First sequence number (inclusive)
+ * @param {number} seq_end - Last sequence number (inclusive)
+ * @returns {Promise<Array>} Array of event payloads
+ */
+export async function queryOutboundEventLog(device_key, seq_start, seq_end) {
+  const { rows } = await pool.query(
+    `SELECT event_payload FROM outbound_event_log
+     WHERE device_key = $1
+       AND sequence_number >= $2
+       AND sequence_number <= $3
+     ORDER BY sequence_number ASC`,
+    [device_key, seq_start, seq_end]
+  );
+  return rows.map(r => r.event_payload);
+}
+
+/**
+ * Clean up old outbound event log entries (older than 7 days).
+ */
+export async function cleanupOutboundEventLog() {
+  const { rowCount } = await pool.query(
+    `DELETE FROM outbound_event_log WHERE created_at < NOW() - INTERVAL '7 days'`
+  );
+  if (rowCount > 0) {
+    console.log(`[EventLog] 🧹 Cleaned up ${rowCount} outbound event log entries older than 7 days`);
+  }
 }
 
 export async function closePool() {
