@@ -1,5 +1,5 @@
 import express from "express";
-import { pool, upsertTokens, deleteUser, deleteThermostat } from "./db.js";
+import { pool, upsertTokens, deleteUser, deleteThermostat, queryOutboundEventLog } from "./db.js";
 import { nowUtc } from "./util.js";
 import { runValidationNow } from "./runtimeValidationScheduler.js";
 import { CORE_API_KEY } from "./config.js";
@@ -186,6 +186,34 @@ export function buildServer() {
     } catch (e) {
       console.error("user delete error:", e);
       res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.get("/api/v1/backfill", requireApiKey, async (req, res) => {
+    try {
+      const { device_key, seq_start, seq_end } = req.query;
+
+      if (!device_key || !seq_start || !seq_end) {
+        return res.status(400).json({ error: "Missing required parameters: device_key, seq_start, seq_end" });
+      }
+
+      const start = parseInt(seq_start, 10);
+      const end = parseInt(seq_end, 10);
+
+      if (isNaN(start) || isNaN(end) || start < 1 || end < start) {
+        return res.status(400).json({ error: "Invalid seq_start or seq_end" });
+      }
+
+      const events = await queryOutboundEventLog(device_key, start, end);
+
+      if (events.length === 0) {
+        return res.status(404).json({ error: "Events not found" });
+      }
+
+      return res.json({ events });
+    } catch (e) {
+      console.error("backfill error:", e);
+      res.status(500).json({ error: e.message });
     }
   });
 
