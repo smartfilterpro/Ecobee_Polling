@@ -124,6 +124,12 @@ export async function ensureSchema() {
   await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS next_sequence_number INTEGER NOT NULL DEFAULT 1;`);
   await pool.query(`ALTER TABLE ecobee_last_state ADD COLUMN IF NOT EXISTS last_posted_at TIMESTAMPTZ;`);
 
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_temperature NUMERIC(5,2);`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_humidity INTEGER;`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_heat_setpoint NUMERIC(5,2);`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS last_cool_setpoint NUMERIC(5,2);`);
+  await pool.query(`ALTER TABLE ecobee_runtime ADD COLUMN IF NOT EXISTS thermostat_mode TEXT;`);
+
   // Add indices for performance
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_tokens_hvac_id ON ecobee_tokens(hvac_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ecobee_tokens_user_id ON ecobee_tokens(user_id);`);
