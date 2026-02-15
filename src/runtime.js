@@ -125,11 +125,8 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
         isActive: false,
         isReachable: false,
         runtimeSeconds: total,
-        temperatureF,
-        humidity,
-        heatSetpoint,
-        coolSetpoint,
-        thermostatMode,
+        // Device is offline — send session metadata only, no sensor telemetry
+        mode: rt.last_running_mode || null,
         observedAt: new Date(nowIso),
       });
       await postToCoreIngestAsync(payload, 'offline-session-end');
@@ -211,6 +208,7 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
       equipmentStatus: eventType,
       previousStatus: prevEquipStatus,
       isActive: true,
+      isReachable: true,
       temperatureF,
       humidity,
       heatSetpoint,
@@ -254,6 +252,7 @@ export async function handleRuntimeAndMaybePostAdaptive({ user_id, hvac_id }, no
       equipmentStatus: 'IDLE',
       previousStatus: prevEquipStatus,
       isActive: false,
+      isReachable: true,
       runtimeSeconds: total,
       temperatureF,
       humidity,

@@ -36,6 +36,7 @@ export function buildCorePayload({
   equipmentStatus,
   previousStatus,
   isActive,
+  isReachable: isReachableParam,
   mode,
   runtimeSeconds,
 
@@ -63,9 +64,15 @@ export function buildCorePayload({
 
   const isoNow = (observedAt || new Date()).toISOString();
 
-  let isReachable = true;
-  if (payloadRaw?.connectivity === "OFFLINE" || payloadRaw?.isReachable === false)
+  // Prefer explicit isReachable parameter; fall back to payloadRaw inference
+  let isReachable;
+  if (typeof isReachableParam === "boolean") {
+    isReachable = isReachableParam;
+  } else if (payloadRaw?.connectivity === "OFFLINE" || payloadRaw?.isReachable === false) {
     isReachable = false;
+  } else {
+    isReachable = true;
+  }
 
   return {
     device_key: deviceKey,
