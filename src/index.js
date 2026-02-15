@@ -50,11 +50,9 @@ async function connectivityScanner() {
           equipmentStatus: 'OFF',
           previousStatus: 'ONLINE',
           isActive: false,
+          isReachable: false,
           mode: 'off',
           runtimeSeconds: null,
-          temperatureF: null,
-          heatSetpoint: null,
-          coolSetpoint: null,
           observedAt: new Date(),
           sourceEventId: uuidv4(),
           payloadRaw: { connectivity: 'OFFLINE', reason: 'stale_timeout' }
