@@ -13,11 +13,12 @@ const CORE_API_KEY = process.env.CORE_API_KEY;
 /**
  * Post runtime report intervals to Core Ingest
  * @param {string} hvac_id - Thermostat identifier
+ * @param {string} user_id - User identifier
  * @param {string} date - Date in YYYY-MM-DD format
  * @param {Array} intervals - Parsed interval data
  * @returns {Promise<void>}
  */
-async function postRuntimeReportToCore(hvac_id, date, intervals) {
+async function postRuntimeReportToCore(hvac_id, user_id, date, intervals) {
   if (!CORE_INGEST_URL) {
     console.warn('[RuntimeValidator] ⚠️ CORE_INGEST_URL not set, skipping Core post');
     return;
@@ -27,7 +28,8 @@ async function postRuntimeReportToCore(hvac_id, date, intervals) {
     console.warn('[RuntimeValidator] ⚠️ CORE_API_KEY missing — posting insecurely (dev only)');
   }
 
-  const payload = {
+  // 1. Post detailed intervals to specialized endpoint (existing behavior)
+  const intervalsPayload = {
     device_key: hvac_id,
     report_date: date,
     intervals: intervals.map(i => ({
@@ -50,7 +52,7 @@ async function postRuntimeReportToCore(hvac_id, date, intervals) {
   try {
     const response = await axios.post(
       `${CORE_INGEST_URL}/ingest/v1/runtime-report`,
-      payload,
+      intervalsPayload,
       {
         headers: {
           'Content-Type': 'application/json',
@@ -60,22 +62,53 @@ async function postRuntimeReportToCore(hvac_id, date, intervals) {
       }
     );
     console.log(`[RuntimeValidator] ✅ Posted ${intervals.length} intervals to Core for ${hvac_id} on ${date}`);
-
-    // Store the runtime report post locally
-    await insertCoreEvent({
-      hvac_id,
-      user_id: null,
-      event_type: 'RUNTIME_REPORT',
-      source_event_id: null,
-      label: 'runtime-report',
-      payload
-    });
-
-    return response.data;
   } catch (err) {
     const status = err.response?.status || 'unknown';
     const msg = err.response?.data?.message || err.message;
-    console.error(`[RuntimeValidator] ❌ Failed to post runtime report to Core [${status}]: ${msg}`);
+    console.error(`[RuntimeValidator] ❌ Failed to post runtime intervals to Core [${status}]: ${msg}`);
+    // Continue to summary event even if intervals fail
+  }
+
+  // 2. **NEW**: Post summary event to standard events pipeline for tracking
+  const summary = getRuntimeSummary(intervals);
+  
+  const summaryPayload = buildCorePayload({
+    deviceKey: hvac_id,
+    userId: user_id,
+    eventType: 'RUNTIME_REPORT',
+    isReachable: true,
+    recordedAt: intervals[0]?.interval_timestamp || new Date().toISOString(),
+    payload: {
+      report_date: date,
+      total_heating_seconds: summary.heating_runtime,
+      total_cooling_seconds: summary.cooling_runtime,
+      total_auxheat_seconds: summary.aux_heat_runtime,
+      total_fan_seconds: summary.fan_runtime,
+      interval_count: intervals.length,
+      coverage_percent: summary.coverage_percent,
+      total_runtime_hours: summary.total_runtime_hours
+    }
+  });
+
+  try {
+    const result = await postToCoreIngestAsync(hvac_id, user_id, summaryPayload);
+    console.log(`[RuntimeValidator] ✅ Posted RUNTIME_REPORT summary event to Core for ${hvac_id} on ${date}`);
+    
+    // Store the runtime report post locally (keep existing behavior)
+    await insertCoreEvent({
+      hvac_id,
+      user_id,
+      event_type: 'RUNTIME_REPORT',
+      source_event_id: null,
+      label: 'runtime-report',
+      payload: summaryPayload
+    });
+    
+    return result;
+  } catch (err) {
+    const status = err.response?.status || 'unknown';
+    const msg = err.response?.data?.message || err.message;
+    console.error(`[RuntimeValidator] ❌ Failed to post runtime report summary to Core [${status}]: ${msg}`);
     // Don't throw - we still want local storage to succeed even if Core post fails
   }
 }
@@ -84,10 +117,11 @@ async function postRuntimeReportToCore(hvac_id, date, intervals) {
  * Fetch and store runtime report data from Ecobee for a specific date
  * @param {string} access_token - Ecobee access token
  * @param {string} hvac_id - Thermostat identifier
+ * @param {string} user_id - User identifier
  * @param {string} date - Date in YYYY-MM-DD format
  * @returns {Promise<object>} Summary of stored data
  */
-export async function fetchAndStoreRuntimeReport(access_token, hvac_id, date) {
+export async function fetchAndStoreRuntimeReport(access_token, hvac_id, user_id, date) {
   try {
     console.log(`[RuntimeValidator] Fetching runtime report for ${hvac_id} on ${date}`);
 
@@ -109,8 +143,8 @@ export async function fetchAndStoreRuntimeReport(access_token, hvac_id, date) {
       stored++;
     }
 
-    // Post intervals to Core Ingest
-    await postRuntimeReportToCore(hvac_id, date, intervals);
+    // Post intervals to Core Ingest (both detailed and summary)
+    await postRuntimeReportToCore(hvac_id, user_id, date, intervals);
 
     // Get summary
     const summary = getRuntimeSummary(intervals);
@@ -163,7 +197,7 @@ export async function validateRuntimeForDate(access_token, user_id, hvac_id, dat
     console.log(`\n[RuntimeValidator] 📊 Validating runtime for ${hvac_id} on ${date}`);
 
     // Fetch and store Ecobee's ground truth
-    await fetchAndStoreRuntimeReport(access_token, hvac_id, date);
+    await fetchAndStoreRuntimeReport(access_token, hvac_id, user_id, date);
 
     // Get Ecobee's totals from database
     const ecobeeRuntime = await getTotalRuntimeFromReport(hvac_id, date);
@@ -207,36 +241,35 @@ export async function validateRuntimeForDate(access_token, user_id, hvac_id, dat
     if (isSignificant) {
       console.warn(`[RuntimeValidator] ⚠️ SIGNIFICANT DISCREPANCY DETECTED!`);
       console.warn(`[RuntimeValidator] Total discrepancy: ${result.total_discrepancy_minutes} minutes`);
-      console.warn(`[RuntimeValidator] Ecobee total: ${Math.round((ecobeeRuntime.total_heating + ecobeeRuntime.total_cooling + ecobeeRuntime.total_aux_heat) / 60)} min`);
-      console.warn(`[RuntimeValidator] Our total: ${Math.round((calculatedRuntime.total_heating + calculatedRuntime.total_cooling + calculatedRuntime.total_aux_heat) / 60)} min`);
+      console.warn(`[RuntimeValidator] Ecobee:`, result.ecobee);
+      console.warn(`[RuntimeValidator] Calculated:`, result.calculated);
+      console.warn(`[RuntimeValidator] Differences:`, discrepancies);
 
-      // Optionally post correction event to Core
-      if (user_id) {
-        const payload = buildCorePayload({
+      // Post validation mismatch event to Core
+      try {
+        const mismatchPayload = buildCorePayload({
           deviceKey: hvac_id,
           userId: user_id,
           eventType: 'RUNTIME_VALIDATION_MISMATCH',
-          equipmentStatus: 'VALIDATION',
-          isActive: false,
-          observedAt: new Date(),
-          sourceEventId: uuidv4(),
-          payloadRaw: {
-            validation_date: date,
-            ecobee_runtime_seconds: ecobeeRuntime.total_heating + ecobeeRuntime.total_cooling + ecobeeRuntime.total_aux_heat,
-            calculated_runtime_seconds: calculatedRuntime.total_heating + calculatedRuntime.total_cooling + calculatedRuntime.total_aux_heat,
+          isReachable: true,
+          recordedAt: new Date().toISOString(),
+          payload: {
+            date,
+            discrepancy_minutes: result.total_discrepancy_minutes,
             discrepancy_seconds: totalDiscrepancy,
-            discrepancy_minutes: result.total_discrepancy_minutes
+            ecobee_runtime: result.ecobee,
+            calculated_runtime: result.calculated,
+            discrepancies
           }
         });
 
-        try {
-          await postToCoreIngestAsync(payload, 'runtime-validation-mismatch');
-        } catch (err) {
-          console.error(`[RuntimeValidator] Failed to post validation mismatch:`, err.message);
-        }
+        await postToCoreIngestAsync(hvac_id, user_id, mismatchPayload);
+        console.log(`[RuntimeValidator] ✅ Posted RUNTIME_VALIDATION_MISMATCH event to Core`);
+      } catch (err) {
+        console.error(`[RuntimeValidator] ❌ Failed to post mismatch event to Core:`, err.message);
       }
     } else {
-      console.log(`[RuntimeValidator] ✅ Runtime validation passed (discrepancy: ${result.total_discrepancy_minutes} min)`);
+      console.log(`[RuntimeValidator] ✅ Validation passed: discrepancy = ${result.total_discrepancy_minutes} minutes (under ${THRESHOLD_SECONDS / 60} minute threshold)`);
     }
 
     return result;
@@ -244,19 +277,4 @@ export async function validateRuntimeForDate(access_token, user_id, hvac_id, dat
     console.error(`[RuntimeValidator] Error validating runtime for ${hvac_id} on ${date}:`, err.message);
     throw err;
   }
-}
-
-/**
- * Validate runtime for yesterday (typical daily job)
- * @param {string} access_token - Ecobee access token
- * @param {string} user_id - User ID
- * @param {string} hvac_id - Thermostat identifier
- * @returns {Promise<object>} Validation results
- */
-export async function validateYesterdayRuntime(access_token, user_id, hvac_id) {
-  const yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-  const dateStr = yesterday.toISOString().split('T')[0]; // YYYY-MM-DD
-
-  return validateRuntimeForDate(access_token, user_id, hvac_id, dateStr);
 }
