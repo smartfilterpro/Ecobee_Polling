@@ -278,3 +278,21 @@ export async function validateRuntimeForDate(access_token, user_id, hvac_id, dat
     throw err;
   }
 }
+
+/**
+ * Validate yesterday's runtime for a specific thermostat
+ * Convenience wrapper used by the daily scheduler
+ * @param {string} access_token - Ecobee access token
+ * @param {string} user_id - User ID
+ * @param {string} hvac_id - Thermostat identifier
+ * @returns {Promise<object>} Validation results
+ */
+export async function validateYesterdayRuntime(access_token, user_id, hvac_id) {
+  const yesterday = new Date();
+  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+  const dateStr = yesterday.toISOString().split('T')[0];
+
+  console.log(`[RuntimeValidator] Validating yesterday (${dateStr}) for ${hvac_id}`);
+
+  return await validateRuntimeForDate(access_token, user_id, hvac_id, dateStr);
+}
