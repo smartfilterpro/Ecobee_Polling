@@ -244,6 +244,22 @@ export async function validateRuntimeForDate(access_token, user_id, hvac_id, dat
 }
 
 /**
+ * Validate yesterday's runtime for a single thermostat
+ * Convenience wrapper around validateRuntimeForDate that auto-computes yesterday's date
+ * @param {string} access_token - Ecobee access token
+ * @param {string} user_id - User ID
+ * @param {string} hvac_id - Thermostat identifier
+ * @returns {Promise<object>} Validation results with discrepancies
+ */
+export async function validateYesterdayRuntime(access_token, user_id, hvac_id) {
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const date = yesterday.toISOString().split('T')[0];
+
+  return validateRuntimeForDate(access_token, user_id, hvac_id, date);
+}
+
+/**
  * Run runtime validation for all thermostats for yesterday
  * @param {Array} thermostats - Array of thermostat objects with access_token, hvac_id, user_id
  * @returns {Promise<Array>} Array of validation results
