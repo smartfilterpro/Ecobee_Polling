@@ -91,7 +91,7 @@ async function postRuntimeReportToCore(hvac_id, user_id, date, intervals) {
   });
 
   try {
-    const result = await postToCoreIngestAsync(hvac_id, user_id, summaryPayload);
+    const result = await postToCoreIngestAsync(summaryPayload, 'RUNTIME_REPORT');
     console.log(`[RuntimeValidator] ✅ Posted RUNTIME_REPORT summary event to Core for ${hvac_id} on ${date}`);
     
     // Store the runtime report post locally (keep existing behavior)
@@ -202,77 +202,41 @@ export async function validateRuntimeForDate(access_token, user_id, hvac_id, dat
     // Get Ecobee's totals from database
     const ecobeeRuntime = await getTotalRuntimeFromReport(hvac_id, date);
 
-    // Get our calculated runtime
+    // Get our calculated totals
     const calculatedRuntime = await getCalculatedRuntimeForDate(hvac_id, date);
 
     // Calculate discrepancies
-    const discrepancies = {
-      heating: Math.abs(ecobeeRuntime.total_heating - calculatedRuntime.total_heating),
-      cooling: Math.abs(ecobeeRuntime.total_cooling - calculatedRuntime.total_cooling),
-      aux_heat: Math.abs(ecobeeRuntime.total_aux_heat - calculatedRuntime.total_aux_heat),
-      fan: Math.abs(ecobeeRuntime.total_fan - calculatedRuntime.total_fan)
-    };
+    const heating_diff = Math.abs(calculatedRuntime.total_heating - (ecobeeRuntime.total_heating || 0));
+    const cooling_diff = Math.abs(calculatedRuntime.total_cooling - (ecobeeRuntime.total_cooling || 0));
+    const aux_heat_diff = Math.abs(calculatedRuntime.total_aux_heat - (ecobeeRuntime.total_aux_heat || 0));
+    const total_diff = heating_diff + cooling_diff + aux_heat_diff;
 
-    const totalDiscrepancy = discrepancies.heating + discrepancies.cooling + discrepancies.aux_heat;
-
-    // Determine if discrepancy is significant (>5 minutes = 300 seconds)
+    // Define thresholds (5 minutes = 300 seconds per mode)
     const THRESHOLD_SECONDS = 300;
-    const isSignificant = totalDiscrepancy > THRESHOLD_SECONDS;
+    const has_discrepancy = total_diff > THRESHOLD_SECONDS;
 
     const result = {
       hvac_id,
       date,
-      ecobee: {
-        heating: ecobeeRuntime.total_heating,
-        cooling: ecobeeRuntime.total_cooling,
-        aux_heat: ecobeeRuntime.total_aux_heat,
-        fan: ecobeeRuntime.total_fan,
-        intervals: ecobeeRuntime.interval_count
-      },
-      calculated: calculatedRuntime,
-      discrepancies,
-      total_discrepancy: totalDiscrepancy,
-      total_discrepancy_minutes: Math.round(totalDiscrepancy / 60 * 100) / 100,
-      is_significant: isSignificant,
-      threshold_seconds: THRESHOLD_SECONDS
+      ecobee_runtime: ecobeeRuntime,
+      calculated_runtime: calculatedRuntime,
+      discrepancies: {
+        heating_diff_seconds: heating_diff,
+        cooling_diff_seconds: cooling_diff,
+        aux_heat_diff_seconds: aux_heat_diff,
+        total_diff_seconds: total_diff,
+        has_discrepancy
+      }
     };
 
-    // Log results
-    if (isSignificant) {
-      console.warn(`[RuntimeValidator] ⚠️ SIGNIFICANT DISCREPANCY DETECTED!`);
-      console.warn(`[RuntimeValidator] Total discrepancy: ${result.total_discrepancy_minutes} minutes`);
-      console.warn(`[RuntimeValidator] Ecobee:`, result.ecobee);
-      console.warn(`[RuntimeValidator] Calculated:`, result.calculated);
-      console.warn(`[RuntimeValidator] Differences:`, discrepancies);
-
-      // Post validation mismatch event to Core
-      try {
-        const mismatchPayload = buildCorePayload({
-          deviceKey: hvac_id,
-          userId: user_id,
-          eventType: 'RUNTIME_VALIDATION_MISMATCH',
-          isReachable: true,
-          recordedAt: new Date().toISOString(),
-          payload: {
-            date,
-            discrepancy_minutes: result.total_discrepancy_minutes,
-            discrepancy_seconds: totalDiscrepancy,
-            ecobee_runtime: result.ecobee,
-            calculated_runtime: result.calculated,
-            discrepancies
-          }
-        });
-
-        await postToCoreIngestAsync(hvac_id, user_id, mismatchPayload);
-        console.log(`[RuntimeValidator] ✅ Posted RUNTIME_VALIDATION_MISMATCH event to Core`);
-      } catch (err) {
-        console.error(`[RuntimeValidator] ❌ Failed to post mismatch event to Core:`, err.message);
-      }
+    if (has_discrepancy) {
+      console.warn(`[RuntimeValidator] ⚠️ Discrepancy detected for ${hvac_id} on ${date}: ${Math.round(total_diff / 60)} min difference`);
     } else {
-      console.log(`[RuntimeValidator] ✅ Validation passed: discrepancy = ${result.total_discrepancy_minutes} minutes (under ${THRESHOLD_SECONDS / 60} minute threshold)`);
+      console.log(`[RuntimeValidator] ✅ Runtime matches for ${hvac_id} on ${date} (within ${THRESHOLD_SECONDS}s threshold)`);
     }
 
     return result;
+
   } catch (err) {
     console.error(`[RuntimeValidator] Error validating runtime for ${hvac_id} on ${date}:`, err.message);
     throw err;
@@ -280,19 +244,59 @@ export async function validateRuntimeForDate(access_token, user_id, hvac_id, dat
 }
 
 /**
- * Validate yesterday's runtime for a specific thermostat
- * Convenience wrapper used by the daily scheduler
- * @param {string} access_token - Ecobee access token
- * @param {string} user_id - User ID
- * @param {string} hvac_id - Thermostat identifier
- * @returns {Promise<object>} Validation results
+ * Run runtime validation for all thermostats for yesterday
+ * @param {Array} thermostats - Array of thermostat objects with access_token, hvac_id, user_id
+ * @returns {Promise<Array>} Array of validation results
  */
-export async function validateYesterdayRuntime(access_token, user_id, hvac_id) {
+export async function runDailyRuntimeValidation(thermostats) {
+  // Get yesterday's date (Ecobee reports are available the next day)
   const yesterday = new Date();
-  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
-  const dateStr = yesterday.toISOString().split('T')[0];
+  yesterday.setDate(yesterday.getDate() - 1);
+  const date = yesterday.toISOString().split('T')[0];
 
-  console.log(`[RuntimeValidator] Validating yesterday (${dateStr}) for ${hvac_id}`);
+  console.log(`\n========================================`);
+  console.log(`🔍 Running daily runtime validation for ${date}`);
+  console.log(`Processing ${thermostats.length} thermostats`);
+  console.log(`========================================\n`);
 
-  return await validateRuntimeForDate(access_token, user_id, hvac_id, dateStr);
+  const results = [];
+  const discrepancies = [];
+
+  for (const t of thermostats) {
+    try {
+      const result = await validateRuntimeForDate(t.access_token, t.user_id, t.hvac_id, date);
+      results.push(result);
+
+      if (result.discrepancies.has_discrepancy) {
+        discrepancies.push({
+          hvac_id: t.hvac_id,
+          total_diff_minutes: Math.round(result.discrepancies.total_diff_seconds / 60),
+          ecobee_total: result.ecobee_runtime.total_runtime_hours,
+          calculated_total: (result.calculated_runtime.total_heating + result.calculated_runtime.total_cooling + result.calculated_runtime.total_aux_heat) / 3600
+        });
+      }
+    } catch (err) {
+      console.error(`[RuntimeValidator] Failed to validate ${t.hvac_id}: ${err.message}`);
+      results.push({
+        hvac_id: t.hvac_id,
+        date,
+        error: err.message
+      });
+    }
+  }
+
+  console.log(`\n========================================`);
+  console.log(`✅ Runtime validation complete`);
+  console.log(`Total validated: ${results.length}`);
+  console.log(`Discrepancies found: ${discrepancies.length}`);
+  
+  if (discrepancies.length > 0) {
+    console.log(`\n⚠️  Devices with discrepancies:`);
+    discrepancies.forEach(d => {
+      console.log(`  ${d.hvac_id}: ${d.total_diff_minutes} min difference (Ecobee: ${d.ecobee_total.toFixed(2)}h, Calc: ${d.calculated_total.toFixed(2)}h)`);
+    });
+  }
+  console.log(`========================================\n`);
+
+  return results;
 }
